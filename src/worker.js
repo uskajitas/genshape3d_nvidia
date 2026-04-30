@@ -12,9 +12,10 @@ class Worker extends EventEmitter {
   constructor(config) {
     super();
     this.config = config;
+    const isLocal = /@(localhost|127\.0\.0\.1)/.test(config.databaseUrl || '');
     this.pool = new Pool({
       connectionString: config.databaseUrl,
-      ssl: { rejectUnauthorized: false },
+      ssl: isLocal ? false : { rejectUnauthorized: false },
       max: 3,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000,
