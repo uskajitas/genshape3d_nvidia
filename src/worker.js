@@ -8,10 +8,23 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 
+// Worker — same code runs on both the 1080 (i7) and the 3090.
+// Behaviour is configured per-machine via .env:
+//   WORKER_ID:     unique id stamped on jobs this machine claims
+//                  ('i7-1080' on the 1080, 'win-3090' on the 3090).
+//   WORKER_MODELS: comma-separated models this machine can run; the
+//                  pending-jobs query filters by this so a machine
+//                  never claims a job it can't actually run.
+// Postgres on the i7 is the single source of truth. Each app's UI
+// filters by its WORKER_ID so users only see what THIS machine has
+// touched.
+const WORKER_ID = (process.env.WORKER_ID || 'i7-1080').trim();
+
 class Worker extends EventEmitter {
   constructor(config) {
     super();
     this.config = config;
+    this.workerId = WORKER_ID;
     const isLocal = /@(localhost|127\.0\.0\.1)/.test(config.databaseUrl || '');
     this.pool = new Pool({
       connectionString: config.databaseUrl,
@@ -171,21 +184,34 @@ class Worker extends EventEmitter {
 
   async poll() {
     try {
-      // Fetch pending jobs
+      // ── Pending ───────────────────────────────────────────────
+      // Only consider pending jobs whose `model` this worker can
+      // actually run. Without this filter, the 3090 might claim a
+      // hunyuan3d job and race the 1080 (fine), but also the 1080
+      // might claim a triposr/sf3d/hi3dgen job and break it.
+      // The 1080's app has the symmetric filter (default 'hunyuan3d').
+      const models = this.config.models || ['hunyuan3d'];
       const { rows: pending } = await this.pool.query(
-        `SELECT * FROM genshape3d_jobs WHERE status = 'pending' ORDER BY "createdAt" ASC`
+        `SELECT * FROM genshape3d_jobs
+         WHERE status = 'pending'
+           AND (model = ANY($1::text[]) OR (model IS NULL AND 'hunyuan3d' = ANY($1::text[])))
+         ORDER BY "createdAt" ASC`,
+        [models]
       );
-      this.pendingJobs = pending;
+      this._pendingForClaim = pending;
+      this.pendingJobs = [];
 
-      // Fetch processing jobs
+      // ── Processing — only this machine's ──────────────────────
       const { rows: processing } = await this.pool.query(
-        `SELECT * FROM genshape3d_jobs WHERE status = 'processing' ORDER BY "startedAt" ASC`
+        `SELECT * FROM genshape3d_jobs WHERE status = 'processing' AND "assignedWorkerId" = $1 ORDER BY "startedAt" ASC`,
+        [this.workerId]
       );
       this.processingJobs = processing;
 
-      // Fetch recently cancelled jobs
+      // ── Cancelled — only this machine's ───────────────────────
       const { rows: cancelled } = await this.pool.query(
-        `SELECT * FROM genshape3d_jobs WHERE status = 'cancelled' ORDER BY "completedAt" DESC LIMIT 20`
+        `SELECT * FROM genshape3d_jobs WHERE status = 'cancelled' AND "assignedWorkerId" = $1 ORDER BY "completedAt" DESC LIMIT 20`,
+        [this.workerId]
       );
       this.cancelledJobs = cancelled;
 
@@ -212,8 +238,8 @@ class Worker extends EventEmitter {
 
       this.emit('stateChanged');
 
-      if (this.activeCount < this.maxConcurrent && pending.length > 0) {
-        const nextJob = pending.find(j => !j.requestCancel);
+      if (this.activeCount < this.maxConcurrent && this._pendingForClaim.length > 0) {
+        const nextJob = this._pendingForClaim.find(j => !j.requestCancel);
         if (nextJob) this.processJob(nextJob);
       }
     } catch (err) {
@@ -245,11 +271,20 @@ class Worker extends EventEmitter {
 
     let tmpDir;
     try {
-      // Update status to processing with startedAt, reset progress
-      await this.pool.query(
-        `UPDATE genshape3d_jobs SET status = 'processing', "startedAt" = $1, "progressPct" = 0, "progressPhase" = 'Preparing...', "progressStep" = 0, "progressTotal" = 0, "updatedAt" = NOW() WHERE id = $2`,
-        [startedAt, job.id]
+      // Atomic claim: only succeeds if still 'pending' (defends
+      // against the 1080 grabbing it first). The UPDATE also stamps
+      // assignedWorkerId so the UI filter sees this job as ours.
+      const claim = await this.pool.query(
+        `UPDATE genshape3d_jobs SET status = 'processing', "startedAt" = $1, "progressPct" = 0, "progressPhase" = 'Preparing...', "progressStep" = 0, "progressTotal" = 0, "assignedWorkerId" = $2, "updatedAt" = NOW() WHERE id = $3 AND status = 'pending'`,
+        [startedAt, this.workerId, job.id]
       );
+      if (claim.rowCount === 0) {
+        console.log(`[Worker] Job ${job.id} taken by another worker (likely 1080), skipping`);
+        this.activeCount--;
+        this.processing = false;
+        this.currentJob = null;
+        return;
+      }
       job.status = 'processing';
       this.emit('jobProcessing', job);
 
@@ -266,10 +301,11 @@ class Worker extends EventEmitter {
       const genParams = this.buildGenParams(job);
       console.log(`[Worker] Generation params:`, JSON.stringify(genParams));
 
-      // Call Hunyuan3D
-      await this.updateProgress(job.id, { pct: 5, phase: 'loading', step: 0, total: genParams.steps, detail: 'Loading AI model...' });
-      const glbPath = await this.callHunyuan3D(inputImagePath, tmpDir, genParams);
-      console.log(`[Worker] GLB generated at ${glbPath}`);
+      // Pick the runner for this job's model (defaults to hunyuan3d).
+      const model = (job.model || 'hunyuan3d').toLowerCase();
+      await this.updateProgress(job.id, { pct: 5, phase: 'loading', step: 0, total: genParams.steps, detail: `Loading ${model} model...` });
+      const glbPath = await this.callRunner(model, inputImagePath, tmpDir, genParams);
+      console.log(`[Worker] ${model} GLB generated at ${glbPath}`);
 
       // Upload GLB to R2
       await this.updateProgress(job.id, { pct: 95, phase: 'uploading', step: genParams.steps, total: genParams.steps, detail: 'Saving 3D model...' });
@@ -427,13 +463,43 @@ class Worker extends EventEmitter {
   }
 
   /**
-   * Call Hunyuan3D directly via Python subprocess.
+   * Pick the python + script + cwd for a given model.
+   * Hunyuan3D uses this repo's own generate.py + PYTHON_CMD env var
+   * (same as the 1080). Other models use the runner venvs we built
+   * under RUNNERS_DIR (defaults to genshape-worker-3090/runners/).
    */
-  async callHunyuan3D(inputImagePath, tmpDir, genParams) {
+  resolveRunner(model) {
+    if (!model || model === 'hunyuan3d') {
+      return {
+        pythonCmd: process.env.PYTHON_CMD || 'python',
+        scriptPath: path.join(__dirname, 'generate.py'),
+        cwd: process.env.HUNYUAN3D_DIR || 'F:/ai/hunyuan3d-2',
+        env: {
+          ...process.env,
+          HUNYUAN3D_DIR: process.env.HUNYUAN3D_DIR || 'F:/ai/hunyuan3d-2',
+        },
+        label: 'Hunyuan3D',
+      };
+    }
+    const runnersDir = process.env.RUNNERS_DIR || 'C:/projects/genshape-worker-3090/runners';
+    return {
+      pythonCmd: path.join(runnersDir, model, '.venv', 'Scripts', 'python.exe'),
+      scriptPath: path.join(runnersDir, model, 'run.py'),
+      cwd: path.join(runnersDir, model),
+      env: { ...process.env },
+      label: model,
+    };
+  }
+
+  /**
+   * Call the appropriate model runner via Python subprocess.
+   * Same protocol as generate.py: PROGRESS:{...json...} on each step,
+   * RESULT:{status, output_path, ...} at end.
+   */
+  async callRunner(model, inputImagePath, tmpDir, genParams) {
     const ext = genParams.file_type || 'glb';
     const outputPath = path.join(tmpDir, `output.${ext}`);
-    const scriptPath = path.join(__dirname, 'generate.py');
-    const pythonCmd = process.env.PYTHON_CMD || 'python';
+    const { pythonCmd, scriptPath, cwd, env, label } = this.resolveRunner(model);
 
     const args = [
       scriptPath,
@@ -453,15 +519,12 @@ class Worker extends EventEmitter {
       args.push('--do-texture');
     }
 
-    console.log(`[Worker] Spawning: ${pythonCmd} ${args.join(' ')}`);
+    console.log(`[Worker] Spawning ${label}: ${pythonCmd} ${args.join(' ')}`);
 
     return new Promise((resolve, reject) => {
       const proc = spawn(pythonCmd, args, {
-        cwd: process.env.HUNYUAN3D_DIR || 'F:/ai/hunyuan3d-2',
-        env: {
-          ...process.env,
-          HUNYUAN3D_DIR: process.env.HUNYUAN3D_DIR || 'F:/ai/hunyuan3d-2',
-        },
+        cwd,
+        env,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
@@ -495,14 +558,14 @@ class Worker extends EventEmitter {
         const text = data.toString();
         stderr += text;
         text.split('\n').filter(Boolean).forEach(line => {
-          console.error(`[Hunyuan3D ERR] ${line}`);
+          console.error(`[${label} ERR] ${line}`);
         });
       });
 
       proc.on('close', (code) => {
         this.currentProc = null;
         if (code !== 0) {
-          return reject(new Error(`Hunyuan3D process exited with code ${code}: ${stderr.slice(-500)}`));
+          return reject(new Error(`${label} process exited with code ${code}: ${stderr.slice(-500)}`));
         }
 
         const resultLine = stdout.split('\n').find(l => l.startsWith('RESULT:'));
@@ -510,16 +573,16 @@ class Worker extends EventEmitter {
           try {
             const result = JSON.parse(resultLine.slice(7));
             if (result.status === 'error') {
-              return reject(new Error(`Hunyuan3D error: ${result.error}`));
+              return reject(new Error(`${label} error: ${result.error}`));
             }
             const finalPath = result.output_path || outputPath;
             if (!fs.existsSync(finalPath)) {
               return reject(new Error(`Output file not found: ${finalPath}`));
             }
-            console.log(`[Worker] Hunyuan3D done: ${result.vertices} verts, ${result.faces} faces, ${result.total_time}s`);
+            console.log(`[Worker] ${label} done: ${result.vertices || '?'} verts, ${result.faces || '?'} faces, ${result.total_time || '?'}s`);
             return resolve(finalPath);
           } catch (e) {
-            return reject(new Error(`Failed to parse Hunyuan3D result: ${e.message}`));
+            return reject(new Error(`Failed to parse ${label} result: ${e.message}`));
           }
         }
 
@@ -527,11 +590,11 @@ class Worker extends EventEmitter {
           return resolve(outputPath);
         }
 
-        reject(new Error(`Hunyuan3D produced no output. stdout: ${stdout.slice(-300)}`));
+        reject(new Error(`${label} produced no output. stdout: ${stdout.slice(-300)}`));
       });
 
       proc.on('error', (err) => {
-        reject(new Error(`Failed to spawn Hunyuan3D process: ${err.message}`));
+        reject(new Error(`Failed to spawn ${label} process: ${err.message}`));
       });
     });
   }
