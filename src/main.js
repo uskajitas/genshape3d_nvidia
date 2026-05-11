@@ -61,7 +61,7 @@ function createWindow() {
     resizable: true,
     skipTaskbar: true,
     frame: true,
-    title: 'GenShape3D Worker',
+    title: `GenShape3D Worker [${process.env.WORKER_ID || 'unknown'}]`,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -87,6 +87,8 @@ function showNotification(title, body) {
   }
 }
 
+const WORKER_LABEL = `[${process.env.WORKER_ID || 'unknown'}]`;
+
 function updateTrayTooltip() {
   if (!tray || !worker) return;
   const state = worker.getState();
@@ -95,25 +97,25 @@ function updateTrayTooltip() {
     const prog = state.currentJob.progress;
     if (prog && prog.pct > 0) {
       const detail = prog.detail || prog.phase;
-      tray.setToolTip(`GenShape3D - ${prog.pct}% - ${detail}`);
+      tray.setToolTip(`GenShape3D ${WORKER_LABEL} - ${prog.pct}% - ${detail}`);
     } else {
-      tray.setToolTip(`GenShape3D - Processing job...`);
+      tray.setToolTip(`GenShape3D ${WORKER_LABEL} - Processing job...`);
     }
   } else if (state.pendingJobs.length > 0) {
-    tray.setToolTip(`GenShape3D - ${state.pendingJobs.length} pending`);
+    tray.setToolTip(`GenShape3D ${WORKER_LABEL} - ${state.pendingJobs.length} pending`);
   } else {
-    tray.setToolTip('GenShape3D Worker - Idle');
+    tray.setToolTip(`GenShape3D Worker ${WORKER_LABEL} - Idle`);
   }
 }
 
 app.on('ready', () => {
   if (process.platform === 'win32') {
-    app.setAppUserModelId('GenShape3D Worker');
+    app.setAppUserModelId(`GenShape3D Worker ${WORKER_LABEL}`);
   }
 
   const icon = createTrayIcon();
   tray = new Tray(icon);
-  tray.setToolTip('GenShape3D Worker - Starting...');
+  tray.setToolTip(`GenShape3D Worker ${WORKER_LABEL} - Starting...`);
 
   function buildTrayMenu() {
     const maxJobs = worker ? worker.maxConcurrent : 1;

@@ -269,7 +269,7 @@
 <body>
   <div class="header">
     <div class="status-dot" id="statusDot"></div>
-    <h1>GenShape3D Worker</h1>
+    <h1 id="workerHeader">GenShape3D Worker</h1>
   </div>
 
   <div class="stats">
@@ -336,6 +336,13 @@
   </div>
 
   <script>
+    (function setWorkerHeader() {
+      const id = (window.api && window.api.workerId) || 'unknown';
+      const h = document.getElementById('workerHeader');
+      if (h) h.textContent = `GenShape3D Worker [${id}]`;
+      document.title = `GenShape3D Worker [${id}]`;
+    })();
+
     function formatTime(ts) {
       if (!ts) return '';
       const d = new Date(ts);
