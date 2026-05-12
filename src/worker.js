@@ -138,6 +138,10 @@ class Worker extends EventEmitter {
         ['"detailLevel"',    "TEXT NOT NULL DEFAULT 'Standard'"],
         ['"doTexture"',      'BOOLEAN NOT NULL DEFAULT false'],
         ['"useMultiView"',   'BOOLEAN NOT NULL DEFAULT false'],
+        ['"gpuMemPeakMB"',   'INTEGER NOT NULL DEFAULT 0'],
+        ['"gpuUtilAvg"',     'REAL NOT NULL DEFAULT 0'],
+        ['"gpuUtilPeak"',    'REAL NOT NULL DEFAULT 0'],
+        ['"gpuSamples"',     'INTEGER NOT NULL DEFAULT 0'],
         ['"progressPct"',    'INTEGER NOT NULL DEFAULT 0'],
         ['"progressPhase"',  "TEXT NOT NULL DEFAULT ''"],
         ['"progressStep"',   'INTEGER NOT NULL DEFAULT 0'],
@@ -437,7 +441,30 @@ class Worker extends EventEmitter {
       // Pick the runner for this job's model (defaults to hunyuan3d).
       const model = (job.model || 'hunyuan3d').toLowerCase();
       await this.updateProgress(job.id, { pct: 5, phase: 'loading', step: 0, total: genParams.steps, detail: `Loading ${model} model...` });
-      const glbPath = await this.callRunner(model, inputImagePath, tmpDir, genParams, auxImagePaths);
+
+      // Start GPU telemetry. nvidia-smi sampled every 2 s while the
+      // runner is alive — we record peak VRAM and avg/peak utilisation
+      // onto the job row so admin can correlate quality with GPU load.
+      const stopGpu = this.startGpuSampler();
+
+      let glbPath;
+      try {
+        glbPath = await this.callRunner(model, inputImagePath, tmpDir, genParams, auxImagePaths);
+      } finally {
+        const gpu = await stopGpu();
+        try {
+          await this.pool.query(
+            `UPDATE genshape3d_jobs
+                SET "gpuMemPeakMB" = $1,
+                    "gpuUtilAvg"   = $2,
+                    "gpuUtilPeak"  = $3,
+                    "gpuSamples"   = $4
+              WHERE id = $5`,
+            [gpu.peakMemMB, gpu.avgUtil, gpu.peakUtil, gpu.samples, job.id],
+          );
+          console.log(`[Worker] GPU stats for ${job.id.slice(0,8)}: peak ${gpu.peakMemMB} MB, util avg ${gpu.avgUtil.toFixed(0)}% / peak ${gpu.peakUtil.toFixed(0)}% (${gpu.samples} samples)`);
+        } catch (e) { /* non-fatal */ }
+      }
       console.log(`[Worker] ${model} GLB generated at ${glbPath}`);
 
       // Upload GLB to R2
@@ -555,6 +582,51 @@ class Worker extends EventEmitter {
       reduce_face: target_face_num > 0,
       target_face_num,
       export_texture: doTexture,
+    };
+  }
+
+  /**
+   * Start sampling GPU state at 2 s intervals via nvidia-smi. Returns
+   * a `stop()` function that resolves with { peakMemMB, avgUtil,
+   * peakUtil, samples }. Cheap (~30 ms per call) and runs in the
+   * background while the worker is waiting on the python child.
+   */
+  startGpuSampler() {
+    let peakMemMB = 0;
+    let utilSum = 0;
+    let peakUtil = 0;
+    let samples = 0;
+    const tick = () => {
+      const proc = spawn('nvidia-smi', [
+        '--query-gpu=memory.used,utilization.gpu',
+        '--format=csv,noheader,nounits',
+      ], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let out = '';
+      proc.stdout.on('data', d => { out += d.toString(); });
+      proc.on('close', () => {
+        const line = out.trim().split('\n')[0];
+        if (!line) return;
+        const [memStr, utilStr] = line.split(',').map(s => s.trim());
+        const mem = parseInt(memStr) || 0;
+        const util = parseFloat(utilStr) || 0;
+        if (mem > peakMemMB) peakMemMB = mem;
+        if (util > peakUtil) peakUtil = util;
+        utilSum += util;
+        samples++;
+      });
+    };
+    const interval = setInterval(tick, 2000);
+    tick(); // first sample immediately
+    return async () => {
+      clearInterval(interval);
+      // tiny wait for any in-flight sample to land
+      await new Promise(r => setTimeout(r, 100));
+      return {
+        peakMemMB,
+        peakUtil,
+        avgUtil: samples > 0 ? utilSum / samples : 0,
+        samples,
+      };
     };
   }
 
