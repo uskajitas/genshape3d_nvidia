@@ -217,6 +217,23 @@ class Worker extends EventEmitter {
       );
       this.cancelledJobs = cancelled;
 
+      // ── Completed (done) — only this machine's ────────────────
+      // Sourced from the DB so history survives worker restarts. The
+      // in-memory unshift on jobComplete still happens but is now a
+      // best-effort cache, not the source of truth.
+      const { rows: completed } = await this.pool.query(
+        `SELECT * FROM genshape3d_jobs WHERE status = 'done' AND "assignedWorkerId" = $1 ORDER BY "completedAt" DESC LIMIT 20`,
+        [this.workerId]
+      );
+      this.completedJobs = completed;
+
+      // ── Failed — only this machine's ──────────────────────────
+      const { rows: failed } = await this.pool.query(
+        `SELECT * FROM genshape3d_jobs WHERE status = 'failed' AND "assignedWorkerId" = $1 ORDER BY "completedAt" DESC LIMIT 20`,
+        [this.workerId]
+      );
+      this.failedJobs = failed;
+
       // Check for requestCancel from the web frontend
       if (this.currentJob) {
         const { rows } = await this.pool.query(
