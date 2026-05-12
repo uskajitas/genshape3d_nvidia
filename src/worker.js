@@ -185,18 +185,19 @@ class Worker extends EventEmitter {
   async poll() {
     try {
       // ── Pending ───────────────────────────────────────────────
-      // Only consider pending jobs whose `model` this worker can
-      // actually run. Without this filter, the 3090 might claim a
-      // hunyuan3d job and race the 1080 (fine), but also the 1080
-      // might claim a triposr/sf3d/hi3dgen job and break it.
-      // The 1080's app has the symmetric filter (default 'hunyuan3d').
+      // The SERVER decides which worker runs which job by setting
+      // preferredWorkerId at job creation time (see server/jobsRepo.ts
+      // -> routeWorker). Each worker ONLY claims jobs preferred for it.
+      // No racing, no mixing across machines. Legacy jobs without a
+      // preference still respect the model filter for back-compat.
       const models = this.config.models || ['hunyuan3d'];
       const { rows: pending } = await this.pool.query(
         `SELECT * FROM genshape3d_jobs
          WHERE status = 'pending'
            AND (model = ANY($1::text[]) OR (model IS NULL AND 'hunyuan3d' = ANY($1::text[])))
+           AND ("preferredWorkerId" = $2 OR "preferredWorkerId" = '' OR "preferredWorkerId" IS NULL)
          ORDER BY "createdAt" ASC`,
-        [models]
+        [models, this.workerId]
       );
       this._pendingForClaim = pending;
       this.pendingJobs = [];
