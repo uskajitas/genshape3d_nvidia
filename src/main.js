@@ -1,9 +1,13 @@
-const { app, Tray, Menu, BrowserWindow, Notification, ipcMain, nativeImage } = require('electron');
 const path = require('path');
+// .env must be loaded BEFORE worker.js is required — worker.js reads
+// process.env.WORKER_ID at top-level, so if .env hasn't been applied
+// yet the worker silently defaults to 'i7-1080' and stops polling for
+// jobs preferred to this machine.
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
+const { app, Tray, Menu, BrowserWindow, Notification, ipcMain, nativeImage } = require('electron');
 const fs = require('fs');
 const { Worker } = require('./worker');
-
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 // ── Persistent log file ──────────────────────────────────────────────────────
 // Always write console output to a file in the repo root so that failures are

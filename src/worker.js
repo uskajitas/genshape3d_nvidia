@@ -184,6 +184,12 @@ class Worker extends EventEmitter {
   }
 
   async poll() {
+    // Heartbeat so we can confirm the loop is alive even when there's
+    // nothing to claim. Logged once every ~30s of polling.
+    this._pollCount = (this._pollCount || 0) + 1;
+    if (this._pollCount % 15 === 1) {
+      console.log(`[Worker] poll #${this._pollCount} (active=${this.activeCount}/${this.maxConcurrent})`);
+    }
     try {
       // ── Pending ───────────────────────────────────────────────
       // The SERVER decides which worker runs which job by setting
@@ -257,12 +263,16 @@ class Worker extends EventEmitter {
 
       this.emit('stateChanged');
 
+      if (this._pendingForClaim.length > 0) {
+        console.log(`[Worker] poll: ${this._pendingForClaim.length} claimable; activeCount=${this.activeCount}/${this.maxConcurrent}`);
+      }
       if (this.activeCount < this.maxConcurrent && this._pendingForClaim.length > 0) {
         const nextJob = this._pendingForClaim.find(j => !j.requestCancel);
         if (nextJob) this.processJob(nextJob);
       }
     } catch (err) {
       console.error('[Worker] Poll error:', err.message);
+      console.error(err.stack);
     }
   }
 
