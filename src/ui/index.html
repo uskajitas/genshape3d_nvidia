@@ -375,15 +375,22 @@
     // server's /api/image proxy. Works from any machine on the LAN or
     // via the public api.genshape3d.com host.
     const API_BASE = 'https://api.genshape3d.com';
-    function thumbUrl(job) {
-      const url = job && (job.imageUrl || job.image_url);
+    function thumbUrlFromString(url) {
       if (!url) return '';
       if (url.startsWith('/api/image')) return API_BASE + url;
-      if (url.includes('/uploads/')) {
-        const key = 'uploads/' + url.split('/uploads/')[1];
-        return API_BASE + '/api/image?key=' + encodeURIComponent(key);
+      // Match the most common R2 path prefixes our system writes.
+      const prefixes = ['/uploads/', '/mvtest/', '/outputs/'];
+      for (const p of prefixes) {
+        if (url.includes(p)) {
+          const key = p.slice(1) + url.split(p)[1];
+          return API_BASE + '/api/image?key=' + encodeURIComponent(key);
+        }
       }
       return url;
+    }
+    function thumbUrl(job) {
+      const url = job && (job.imageUrl || job.image_url);
+      return thumbUrlFromString(url);
     }
     function jobName(job) {
       return (job && (job.name || '')).trim() || 'Untitled';
@@ -394,7 +401,34 @@
       if (!u) {
         return '<div style="width:' + px + 'px;height:' + px + 'px;border-radius:6px;background:#0f3460;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#5a6c80;font-size:11px">no img</div>';
       }
-      return '<img src="' + u + '" alt="" style="width:' + px + 'px;height:' + px + 'px;object-fit:cover;border-radius:6px;background:#0f3460;flex-shrink:0" loading="lazy">';
+      return '<a href="' + u + '" target="_blank" rel="noopener" style="display:block;flex-shrink:0" title="open original"><img src="' + u + '" alt="" style="width:' + px + 'px;height:' + px + 'px;object-fit:cover;border-radius:6px;background:#0f3460" loading="lazy"></a>';
+    }
+    // Render aux view thumbnails for a job. auxImageUrls is the jsonb
+    // array on the row. Each thumb opens its full image in a new tab.
+    function auxThumbsHtml(job, size) {
+      const aux = job && Array.isArray(job.auxImageUrls) ? job.auxImageUrls : [];
+      if (aux.length === 0) return '';
+      const px = size || 36;
+      const items = aux.map(function (url, i) {
+        const u = thumbUrlFromString(url);
+        if (!u) return '';
+        return '<a href="' + u + '" target="_blank" rel="noopener" title="aux view ' + (i + 1) + '" style="display:block">'
+             + '<img src="' + u + '" alt="" style="width:' + px + 'px;height:' + px + 'px;object-fit:cover;border-radius:4px;background:#0f3460;border:1px solid #1a3a5c" loading="lazy"></a>';
+      }).join('');
+      return '<div style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap" title="' + aux.length + ' auxiliary view(s) used for multi-view conditioning">'
+           + '<span style="font-size:9px;color:#5a6c80;align-self:center;margin-right:3px">+' + aux.length + '</span>'
+           + items
+           + '</div>';
+    }
+    // Result mesh link — shown only when the job has a resultUrl. Opens
+    // the GLB through the same /api/image proxy (works for any R2 key).
+    function resultLinkHtml(job) {
+      const url = job && job.resultUrl;
+      if (!url) return '';
+      const proxied = thumbUrlFromString(url);
+      return '<a href="' + proxied + '" target="_blank" rel="noopener" '
+           + 'style="display:inline-block;margin-top:6px;font-size:11px;padding:3px 8px;border-radius:4px;background:#1b3a1b;color:#4caf50;font-weight:600;text-decoration:none" '
+           + 'title="open the generated GLB">View 3D ↗</a>';
     }
 
     async function cancelJob(jobId) {
@@ -440,12 +474,16 @@
 
       return `
         <li class="job-item" style="display:flex;gap:10px;align-items:flex-start">
-          ${thumbHtml(job, 56)}
+          <div style="display:flex;flex-direction:column;align-items:center;gap:4px;flex-shrink:0">
+            ${thumbHtml(job, 56)}
+            ${auxThumbsHtml(job, 28)}
+          </div>
           <div style="flex:1;min-width:0">
             <div style="font-weight:600;color:#e0e0e0;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${jobName(job)}</div>
             <div style="margin:3px 0">${texBadge}${qualBadge}<span class="model-tag ${model}">${model}</span>${extra}</div>
             <div class="job-id" style="font-size:10px;color:#5a6c80">${shortId(job.id)}</div>
             ${timeInfo}
+            ${resultLinkHtml(job)}
           </div>
           <div class="job-right">
             <span class="badge ${statusClass}">${job.status || statusClass}</span>
@@ -476,7 +514,12 @@
         const cjTex    = !!cj.doTexture;
         const cjOct    = cj.octreeResolution || 0;
         const cjFaces  = cj.targetFaceCount || 0;
-        document.getElementById('currentJobThumb').innerHTML = thumbHtml(cj, 96);
+        document.getElementById('currentJobThumb').innerHTML =
+          '<div style="display:flex;flex-direction:column;align-items:center;gap:6px">'
+          + thumbHtml(cj, 96)
+          + auxThumbsHtml(cj, 44)
+          + resultLinkHtml(cj)
+          + '</div>';
         document.getElementById('currentJobName').textContent = jobName(cj);
         document.getElementById('currentJobId').innerHTML =
           `<div style="margin:4px 0 6px">
