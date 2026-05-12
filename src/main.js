@@ -1,8 +1,31 @@
 const { app, Tray, Menu, BrowserWindow, Notification, ipcMain, nativeImage } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const { Worker } = require('./worker');
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
+// ── Persistent log file ──────────────────────────────────────────────────────
+// Always write console output to a file in the repo root so that failures are
+// inspectable even when Electron was launched by Task Scheduler (which throws
+// stdout away by default). Rotates at 5MB.
+const logPath = path.join(__dirname, '..', 'worker.log');
+try {
+  if (fs.existsSync(logPath) && fs.statSync(logPath).size > 5 * 1024 * 1024) {
+    fs.renameSync(logPath, logPath + '.1');
+  }
+} catch {}
+const logStream = fs.createWriteStream(logPath, { flags: 'a' });
+const _origLog = console.log.bind(console);
+const _origErr = console.error.bind(console);
+const _origWarn = console.warn.bind(console);
+function ts() { return new Date().toISOString(); }
+console.log  = (...a) => { logStream.write(`[${ts()}] ${a.join(' ')}\n`);    _origLog(...a); };
+console.warn = (...a) => { logStream.write(`[${ts()}] WARN ${a.join(' ')}\n`); _origWarn(...a); };
+console.error = (...a) => { logStream.write(`[${ts()}] ERROR ${a.join(' ')}\n`); _origErr(...a); };
+process.on('uncaughtException', (e) => { console.error('uncaughtException:', e && e.stack || e); });
+process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', e && e.stack || e); });
+console.log(`[main] Worker process started, WORKER_ID=${process.env.WORKER_ID}, logging to ${logPath}`);
 
 // Singleton — only one instance allowed
 const gotLock = app.requestSingleInstanceLock();

@@ -120,6 +120,7 @@ class Worker extends EventEmitter {
         ['"progressStep"',   'INTEGER NOT NULL DEFAULT 0'],
         ['"progressTotal"',  'INTEGER NOT NULL DEFAULT 0'],
         ['"requestCancel"',  'BOOLEAN NOT NULL DEFAULT false'],
+        ['"errorMessage"',   "TEXT NOT NULL DEFAULT ''"],
         ['"octreeResolution"', 'INTEGER NOT NULL DEFAULT 0'],
         ['"targetFaceCount"',  'INTEGER NOT NULL DEFAULT 0'],
         ['"inferenceSteps"',   'INTEGER NOT NULL DEFAULT 0'],
@@ -325,8 +326,9 @@ class Worker extends EventEmitter {
       this.completedJobs.unshift(job);
       this.emit('jobComplete', job);
     } catch (err) {
-      console.error(`[Worker] Job ${job.id} failed:`, err.message);
+      console.error(`[Worker] Job ${job.id} failed:`, err && err.stack || err.message);
       const completedAt = new Date().toISOString();
+      const errMsg = (err && (err.stack || err.message) || String(err)).slice(0, 4000);
       try {
         const { rows } = await this.pool.query(`SELECT status FROM genshape3d_jobs WHERE id = $1`, [job.id]);
         if (rows[0]?.status === 'cancelled') {
@@ -334,8 +336,8 @@ class Worker extends EventEmitter {
           job.status = 'cancelled';
         } else {
           await this.pool.query(
-            `UPDATE genshape3d_jobs SET status = 'failed', "completedAt" = $1, "progressPhase" = 'failed', "updatedAt" = NOW() WHERE id = $2`,
-            [completedAt, job.id]
+            `UPDATE genshape3d_jobs SET status = 'failed', "completedAt" = $1, "progressPhase" = 'failed', "errorMessage" = $2, "updatedAt" = NOW() WHERE id = $3`,
+            [completedAt, errMsg, job.id]
           );
           job.status = 'failed';
           job.completedAt = completedAt;
