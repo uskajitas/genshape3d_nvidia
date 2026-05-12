@@ -269,7 +269,18 @@ class Worker extends EventEmitter {
       }
       if (this.activeCount < this.maxConcurrent && this._pendingForClaim.length > 0) {
         const nextJob = this._pendingForClaim.find(j => !j.requestCancel);
-        if (nextJob) this.processJob(nextJob);
+        if (nextJob) {
+          // VRAM safety guard: two textured Hunyuan3D jobs together OOM
+          // a 24 GB card (each is ~6 GB shape + ~6 GB paint). Hold the
+          // pending one until the running one finishes.
+          const isTexHun = (j) => (j.model || 'hunyuan3d').toLowerCase() === 'hunyuan3d' && j.doTexture;
+          const oomRisk = isTexHun(nextJob) && this.processingJobs.some(isTexHun);
+          if (oomRisk) {
+            console.log(`[Worker] holding ${nextJob.id.slice(0,8)} — another textured-Hunyuan3D job is already running (would OOM).`);
+          } else {
+            this.processJob(nextJob);
+          }
+        }
       }
     } catch (err) {
       console.error('[Worker] Poll error:', err.message);

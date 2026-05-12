@@ -183,6 +183,11 @@ app.on('ready', () => {
     r2Bucket: process.env.R2_BUCKET || 'genshape3d',
     r2PublicUrl: process.env.R2_PUBLIC_URL || '',
     pollInterval: parseInt(process.env.POLL_INTERVAL || '10000', 10),
+    // How many jobs this machine can run in parallel. 1 is safe on any
+    // GPU; 2 fits on a 24 GB card for almost any mix except two
+    // simultaneous textured-Hunyuan3D jobs (paint pipeline ~6 GB on top
+    // of shape ~6 GB — two of each is 24 GB and OOMs). Set via env.
+    maxConcurrent: parseInt(process.env.MAX_CONCURRENT || '1', 10),
     // Models this worker can run. The 1080 has only Hunyuan3D; the 3090
     // declares 'hunyuan3d,triposr,sf3d,hi3dgen'. worker.js's poll filters
     // pending by this list — without it, .env's WORKER_MODELS was ignored.
