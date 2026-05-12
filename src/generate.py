@@ -253,14 +253,42 @@ def main():
     print('[generate.py] Loading shape generation pipeline...', flush=True)
     from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 
-    if args.steps <= 10:
+    # Pick variant. The mv-trained model has multi-view priors baked in
+    # from training — it tends to handle the "what's behind the front
+    # view" problem better even when fed a single image, so we default
+    # to it. Falls back to turbo/standard if the mv weights aren't on
+    # disk yet, so a fresh install still works.
+    import os as _os
+    mv_weights = _os.path.join(
+        _os.path.expanduser('~'), '.cache', 'huggingface', 'hub',
+        'models--tencent--Hunyuan3D-2mv',
+    )
+    mv_available = _os.path.isdir(mv_weights)
+
+    # Per-job opt-out: USE_MV_VARIANT=false in the worker env forces the
+    # legacy single-view path even when the mv weights exist. Used for
+    # A/B testing.
+    mv_opt_out = (_os.environ.get('USE_MV_VARIANT', '').lower() in ('0', 'false', 'no'))
+
+    if mv_available and not mv_opt_out:
+        repo_id = 'tencent/Hunyuan3D-2mv'
+        subfolder = 'hunyuan3d-dit-v2-mv'
+        if args.aux_images:
+            print(f'[generate.py] mv variant + {len(args.aux_images)} aux view(s) — full multi-view conditioning', flush=True)
+        else:
+            print('[generate.py] mv variant on single image — using multi-view priors without explicit alt views', flush=True)
+    elif args.steps <= 10:
+        repo_id = 'tencent/Hunyuan3D-2'
         subfolder = 'hunyuan3d-dit-v2-0-turbo'
+        print('[generate.py] mv variant unavailable, using turbo single-view', flush=True)
     else:
+        repo_id = 'tencent/Hunyuan3D-2'
         subfolder = 'hunyuan3d-dit-v2-0'
+        print('[generate.py] mv variant unavailable, using standard single-view', flush=True)
 
     pipeline = from_pretrained_with_progress(
         Hunyuan3DDiTFlowMatchingPipeline.from_pretrained,
-        'tencent/Hunyuan3D-2',
+        repo_id,
         subfolder=subfolder,
         device='cuda',
         dtype=torch.float16,
