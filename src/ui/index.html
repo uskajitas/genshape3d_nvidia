@@ -428,12 +428,23 @@
         : '';
 
       const model = (job.model || 'hunyuan3d').toLowerCase();
+      const steps = job.inferenceSteps ?? job.steps ?? 0;
+      const isHigh = steps > 10;
+      const hasTex = !!(job.doTexture || job.tex);
+      const octree = job.octreeResolution || 0;
+      const faces  = job.targetFaceCount || 0;
+
+      const texBadge = `<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${hasTex ? '#EC4899' : '#374151'};color:${hasTex ? '#fff' : '#9CA3AF'};margin-right:4px">${hasTex ? 'TEXTURED' : 'NO TEX'}</span>`;
+      const qualBadge = `<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${isHigh ? '#C084FC' : '#374151'};color:${isHigh ? '#fff' : '#9CA3AF'};margin-right:4px">${isHigh ? 'HIGH' : 'STD'}</span>`;
+      const extra = (octree || faces || steps) ? `<span style="font-size:10px;color:#5a6c80;margin-left:2px">${steps ? steps + ' steps' : ''}${steps && octree ? ' · ' : ''}${octree ? 'octree ' + octree : ''}${(steps||octree) && faces ? ' · ' : ''}${faces ? (faces/1000).toFixed(0) + 'k faces' : ''}</span>` : '';
+
       return `
         <li class="job-item" style="display:flex;gap:10px;align-items:flex-start">
-          ${thumbHtml(job, 48)}
+          ${thumbHtml(job, 56)}
           <div style="flex:1;min-width:0">
             <div style="font-weight:600;color:#e0e0e0;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${jobName(job)}</div>
-            <div class="job-id" style="font-size:11px;color:#5a6c80">${shortId(job.id)}<span class="model-tag ${model}">${model}</span></div>
+            <div style="margin:3px 0">${texBadge}${qualBadge}<span class="model-tag ${model}">${model}</span>${extra}</div>
+            <div class="job-id" style="font-size:10px;color:#5a6c80">${shortId(job.id)}</div>
             ${timeInfo}
           </div>
           <div class="job-right">
@@ -458,11 +469,25 @@
       const section = document.getElementById('currentSection');
       if (state.currentJob) {
         section.style.display = '';
-        const cjModel = (state.currentJob.model || 'hunyuan3d').toLowerCase();
-        document.getElementById('currentJobThumb').innerHTML = thumbHtml(state.currentJob, 80);
-        document.getElementById('currentJobName').textContent = jobName(state.currentJob);
+        const cj       = state.currentJob;
+        const cjModel  = (cj.model || 'hunyuan3d').toLowerCase();
+        const cjSteps  = cj.inferenceSteps ?? 0;
+        const cjHigh   = cjSteps > 10;
+        const cjTex    = !!cj.doTexture;
+        const cjOct    = cj.octreeResolution || 0;
+        const cjFaces  = cj.targetFaceCount || 0;
+        document.getElementById('currentJobThumb').innerHTML = thumbHtml(cj, 96);
+        document.getElementById('currentJobName').textContent = jobName(cj);
         document.getElementById('currentJobId').innerHTML =
-          `${state.currentJob.id}<span class="model-tag ${cjModel}">${cjModel}</span>`;
+          `<div style="margin:4px 0 6px">
+            <span style="display:inline-block;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.04em;background:${cjTex?'#EC4899':'#374151'};color:${cjTex?'#fff':'#9CA3AF'};margin-right:5px">${cjTex?'TEXTURED':'NO TEXTURE'}</span>
+            <span style="display:inline-block;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.04em;background:${cjHigh?'#C084FC':'#374151'};color:${cjHigh?'#fff':'#9CA3AF'};margin-right:5px">${cjHigh?'HIGH':'STANDARD'}</span>
+            <span class="model-tag ${cjModel}">${cjModel}</span>
+          </div>
+          <div style="font-size:11px;color:#5a6c80;margin-bottom:4px">
+            ${cjSteps ? cjSteps + ' steps · ' : ''}${cjOct ? 'octree ' + cjOct : ''}${cjOct && cjFaces ? ' · ' : ''}${cjFaces ? (cjFaces/1000).toFixed(0) + 'k faces target' : ''}
+          </div>
+          <div style="font-family:Consolas,monospace;font-size:11px;color:#5a6c80">${cj.id}</div>`;
         const prog = state.currentJob.progress;
         const bar = document.querySelector('.progress-bar');
         const detailEl = document.getElementById('currentJobDetail');
