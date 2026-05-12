@@ -564,11 +564,15 @@ class Worker extends EventEmitter {
   }
 
   /**
-   * Quick heuristic: is the subject's foreground bbox taller than wide?
-   * If yes, Zero123++ likely produces consistent rotations. If wider
-   * than tall (horizontally-posed quadruped, vehicle from above), it
-   * drifts and we should skip auto-mv. Resolves to true on any error
-   * so we err toward generating views.
+   * Heuristic: is the subject reasonable for Zero123++ to rotate around?
+   * Zero123++ drifts when subjects are EXTREMELY horizontal (sprawled
+   * quadrupeds with tail-to-nose stretch >> height). Normal vehicles,
+   * ships, characters, kangaroos, figurines all rotate fine — even if
+   * slightly wider than tall.
+   *
+   * We accept anything where height/width >= 0.5 (i.e. only truly
+   * sprawled subjects like a lying iguana get filtered out, aspect
+   * <0.5). Resolves to true on any error (err toward generating views).
    */
   async isUprightSubject(imagePath) {
     const pythonCmd = process.env.PYTHON_CMD || 'python';
@@ -582,17 +586,19 @@ if img.mode == 'RGBA':
 else:
     bbox = img.convert('L').point(lambda v: 0 if v > 240 else 255).getbbox()
 if not bbox:
-    print('true')
+    print('true|no-bbox')
 else:
     w = bbox[2] - bbox[0]
     h = bbox[3] - bbox[1]
-    print('true' if h >= w else 'false')
+    ratio = h / max(w, 1)
+    print(('true' if ratio >= 0.5 else 'false') + f'|ratio={ratio:.2f}')
 `], { stdio: ['ignore', 'pipe', 'pipe'] });
       let out = '';
       proc.stdout.on('data', d => { out += d.toString(); });
       proc.on('close', code => {
-        const verdict = out.trim().endsWith('true');
-        console.log(`[Worker] upright-subject check: ${verdict ? 'YES (auto-mv on)' : 'NO (skip auto-mv, horizontal)'}`);
+        const line = out.trim();
+        const verdict = line.startsWith('true');
+        console.log(`[Worker] upright-subject check: ${verdict ? 'YES' : 'NO'} (${line.split('|')[1] || ''})`);
         resolve(verdict);
       });
       proc.on('error', () => resolve(true));
