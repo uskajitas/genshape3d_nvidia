@@ -346,19 +346,25 @@ class Worker extends EventEmitter {
 
       // ── Local multi-view auto-generation ─────────────────────────
       // If no aux views came in with the job, generate them right here
-      // on this machine using Zero123++ (no Replicate, no API). Only
-      // runs for hunyuan3d jobs (the only runner that uses multi-view
-      // input today) and only if the local Zero123++ weights are cached.
+      // on this machine using Zero123++ (no Replicate, no API).
       //
-      // Disabled by default: Zero123++ produces inconsistent views on
-      // horizontally-posed subjects (quadrupeds, vehicles seen from
-      // above) and the resulting mv reconstruction comes out worse than
-      // single-image. The mv-trained variant of Hunyuan3D already does
-      // well on single-image input via its baked-in priors. Set
-      // ENABLE_AUTO_MULTIVIEW=true in the worker env to re-enable.
+      // Zero123++ assumes the subject's vertical axis is upright in the
+      // canvas — works great for figurines, characters, vehicles seen
+      // straight, bipeds (kangaroo, person, robot). Drifts badly on
+      // horizontally-posed subjects (iguana, dog lying down, car seen
+      // from above). We detect the foreground bounding box: if it's
+      // taller-than-wide we run auto-mv; if it's wider-than-tall we
+      // skip and let mv-on-single-image handle it.
+      //
+      // ENABLE_AUTO_MULTIVIEW=false in env disables this entirely.
       const jobModelLower = (job.model || 'hunyuan3d').toLowerCase();
-      const autoMvOn = (process.env.ENABLE_AUTO_MULTIVIEW || '').toLowerCase() === 'true';
-      if (autoMvOn && auxImagePaths.length === 0 && jobModelLower === 'hunyuan3d') {
+      const autoMvOff = (process.env.ENABLE_AUTO_MULTIVIEW || 'true').toLowerCase() === 'false';
+      const shouldAutoMv =
+        !autoMvOff &&
+        auxImagePaths.length === 0 &&
+        jobModelLower === 'hunyuan3d' &&
+        await this.isUprightSubject(inputImagePath);
+      if (shouldAutoMv) {
         try {
           const generated = await this.generateLocalMultiView(inputImagePath, tmpDir, job.id);
           if (generated.localPaths && generated.localPaths.length > 0) {
@@ -544,6 +550,42 @@ class Worker extends EventEmitter {
     const filePath = path.join(tmpDir, `${baseName}${ext}`);
     fs.writeFileSync(filePath, buffer);
     return filePath;
+  }
+
+  /**
+   * Quick heuristic: is the subject's foreground bbox taller than wide?
+   * If yes, Zero123++ likely produces consistent rotations. If wider
+   * than tall (horizontally-posed quadruped, vehicle from above), it
+   * drifts and we should skip auto-mv. Resolves to true on any error
+   * so we err toward generating views.
+   */
+  async isUprightSubject(imagePath) {
+    const pythonCmd = process.env.PYTHON_CMD || 'python';
+    return new Promise(resolve => {
+      const proc = spawn(pythonCmd, ['-c', `
+import sys
+from PIL import Image
+img = Image.open(${JSON.stringify(imagePath)})
+if img.mode == 'RGBA':
+    bbox = img.split()[3].getbbox()
+else:
+    bbox = img.convert('L').point(lambda v: 0 if v > 240 else 255).getbbox()
+if not bbox:
+    print('true')
+else:
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    print('true' if h >= w else 'false')
+`], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      proc.stdout.on('data', d => { out += d.toString(); });
+      proc.on('close', code => {
+        const verdict = out.trim().endsWith('true');
+        console.log(`[Worker] upright-subject check: ${verdict ? 'YES (auto-mv on)' : 'NO (skip auto-mv, horizontal)'}`);
+        resolve(verdict);
+      });
+      proc.on('error', () => resolve(true));
+    });
   }
 
   /**
