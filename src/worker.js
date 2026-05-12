@@ -360,20 +360,19 @@ class Worker extends EventEmitter {
       // ENABLE_AUTO_MULTIVIEW=false in env disables this entirely.
       const jobModelLower = (job.model || 'hunyuan3d').toLowerCase();
       const autoMvOff = (process.env.ENABLE_AUTO_MULTIVIEW || 'true').toLowerCase() === 'false';
-      // Per-job override from the UI tick. Explicit false = skip regardless,
-      // explicit true = run regardless of upright-detection. Null/undefined
-      // falls back to the upright bbox heuristic.
+      // Per-job behaviour:
+      //   useMultiView === true  -> force auto-mv regardless of orientation
+      //   anything else          -> let the upright-bbox heuristic decide
+      // (False is treated as "default", not "explicit no" — the toggle in
+      // the UI is opt-IN to override; opt-OUT happens via env or by the
+      // heuristic itself when the subject is horizontal.)
       let shouldAutoMv;
       if (autoMvOff || auxImagePaths.length > 0 || jobModelLower !== 'hunyuan3d') {
         shouldAutoMv = false;
       } else if (job.useMultiView === true) {
         shouldAutoMv = true;
         console.log('[Worker] useMultiView=true on job, running auto-mv regardless of orientation.');
-      } else if (job.useMultiView === false) {
-        // Per the new DB default. Skip unless user explicitly opted in.
-        shouldAutoMv = false;
       } else {
-        // Legacy rows with null useMultiView — use the heuristic.
         shouldAutoMv = await this.isUprightSubject(inputImagePath);
       }
       if (shouldAutoMv) {
