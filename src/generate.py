@@ -303,24 +303,39 @@ def main():
     if args.seed > 0:
         generator = torch.Generator(device='cuda').manual_seed(args.seed)
 
-    # Build the image input. If aux views were provided, pass a LIST to the
-    # pipeline (Hunyuan3D-2mv uses cross-view attention; the standard variant
-    # falls back to the first image). If aux loading or the pipeline call
-    # with a list fails, we retry with just the primary image.
-    pipeline_image = image
-    if args.aux_images:
-        aux_imgs = []
-        for p in args.aux_images:
-            try:
-                img = Image.open(p)
-                if img.mode != 'RGBA':
-                    img = img.convert('RGBA')
-                aux_imgs.append(img)
-            except Exception as e:
-                print(f'[generate.py] Skipping aux image {p}: {e}', flush=True)
+    # Build the image input. The mv variant REQUIRES a dict {label: image}
+    # (its preprocessor iterates image_dict.items()), even for a single
+    # view. The standard variant takes a bare PIL Image.
+    using_mv = (subfolder == 'hunyuan3d-dit-v2-mv')
+
+    aux_imgs = []
+    for p in args.aux_images:
+        try:
+            img = Image.open(p)
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+            aux_imgs.append(img)
+        except Exception as e:
+            print(f'[generate.py] Skipping aux image {p}: {e}', flush=True)
+
+    if using_mv:
+        # Map aux images to canonical labels in order. Hunyuan3D-2mv's
+        # example set is front/back/left; we slot extra views into those.
+        labels = ['back', 'left', 'right']
+        pipeline_image = {'front': image}
+        for i, aux in enumerate(aux_imgs):
+            if i < len(labels):
+                pipeline_image[labels[i]] = aux
         if aux_imgs:
-            pipeline_image = [image] + aux_imgs
-            print(f'[generate.py] Using {len(aux_imgs)} aux view(s) (multi-view conditioning)', flush=True)
+            print(f'[generate.py] mv variant: {len(pipeline_image)} view(s) — keys={list(pipeline_image.keys())}', flush=True)
+        else:
+            print('[generate.py] mv variant: single-image dict {"front": ...}', flush=True)
+    else:
+        # Legacy single-view path for the standard / turbo variants.
+        pipeline_image = image
+        if aux_imgs:
+            # Standard variant can't use them; explicit log so it's not silent.
+            print(f'[generate.py] {len(aux_imgs)} aux image(s) provided but standard variant is single-view — ignoring.', flush=True)
 
     # Generate mesh
     # The tqdm hook will emit progress for diffusion (5-15%) and volume decoding (15-85%)
