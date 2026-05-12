@@ -24,8 +24,15 @@ from PIL import Image
 import torch
 
 
-# Index → canonical label (Zero123++ outputs at 30° azimuth increments).
-INDEX_TO_LABEL = {0: 'three_q', 1: 'side', 2: 'back'}
+# Index → canonical label.
+# Zero123++ outputs 6 views at 30° azimuth increments around the equator.
+# Hunyuan3D-2-mv was trained on triplets {front, back, left} per Tencent's
+# example_mv_images. So we pick the indices that map closest to those:
+#   index 2 (~150° azimuth) -> 'back'
+#   index 4 (~270° azimuth) -> 'left'
+# The "front" view is the user's original input image (provided separately
+# by generate.py, NOT from Zero123++).
+INDEX_TO_LABEL = {2: 'back', 4: 'left'}
 
 
 def emit_progress(pct: int, detail: str = '') -> None:

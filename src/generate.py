@@ -319,13 +319,18 @@ def main():
             print(f'[generate.py] Skipping aux image {p}: {e}', flush=True)
 
     if using_mv:
-        # Map aux images to canonical labels in order. Hunyuan3D-2mv's
-        # example set is front/back/left; we slot extra views into those.
-        labels = ['back', 'left', 'right']
+        # Hunyuan3D-2-mv was trained on triplets {front, back, left}.
+        # Worker's multi-view step now produces files named back.png and
+        # left.png — we match by filename so the labels line up no matter
+        # what order they arrive.
         pipeline_image = {'front': image}
-        for i, aux in enumerate(aux_imgs):
-            if i < len(labels):
-                pipeline_image[labels[i]] = aux
+        for p, aux in zip(args.aux_images, aux_imgs):
+            base = os.path.basename(p).lower()
+            if base.startswith('back'):  label = 'back'
+            elif base.startswith('left'): label = 'left'
+            elif base.startswith('right'): label = 'right'
+            else: continue  # ignore anything that doesn't match
+            pipeline_image[label] = aux
         if aux_imgs:
             print(f'[generate.py] mv variant: {len(pipeline_image)} view(s) — keys={list(pipeline_image.keys())}', flush=True)
         else:
