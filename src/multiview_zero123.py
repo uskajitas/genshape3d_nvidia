@@ -69,9 +69,15 @@ def main() -> int:
     print(f'[mv] generated grid in {time.time() - t1:.1f}s', flush=True)
     emit_progress(80, 'Splitting grid…')
 
-    # Zero123++ outputs a 3 cols × 2 rows grid (6 views in reading order).
+    # Zero123++ outputs a 2 cols × 3 rows grid (the canvas is taller
+    # than wide, e.g. 640×960). Reading order: 6 views at 30° azimuth
+    # increments around the equator. Auto-detect orientation just in
+    # case a future model version changes layout.
     W, H = out.size
-    cols, rows = 3, 2
+    if H > W:
+        cols, rows = 2, 3
+    else:
+        cols, rows = 3, 2
     cw, ch = W // cols, H // rows
     paths = {}
     for r in range(rows):
