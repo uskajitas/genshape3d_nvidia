@@ -42,6 +42,74 @@ def emit_progress(pct, phase, step=0, total=0, detail=''):
     print(f'PROGRESS:{json.dumps(obj)}', flush=True)
 
 
+def _hf_cache_has(repo_id: str) -> bool:
+    """Return True if the HuggingFace hub cache already has a snapshot for
+    this repo. Used to decide whether to surface a 'downloading weights'
+    progress line before the (otherwise silent) from_pretrained call."""
+    import os
+    hub = os.environ.get('HF_HUB_CACHE') or os.environ.get('HF_HOME')
+    candidates = []
+    if hub:
+        candidates.append(os.path.join(hub, 'hub') if not hub.endswith('hub') else hub)
+    candidates.append(os.path.join(os.path.expanduser('~'), '.cache', 'huggingface', 'hub'))
+    folder_name = 'models--' + repo_id.replace('/', '--')
+    for base in candidates:
+        snap_dir = os.path.join(base, folder_name, 'snapshots')
+        if os.path.isdir(snap_dir):
+            try:
+                if any(os.scandir(snap_dir)):
+                    return True
+            except OSError:
+                pass
+    return False
+
+
+def from_pretrained_with_progress(loader, *args, **kwargs):
+    """Call a `<Pipeline>.from_pretrained(...)` while emitting PROGRESS
+    lines. The first call after a fresh install pulls ~7 GB of model
+    weights from HuggingFace and is otherwise completely silent — the
+    user sees 'Loading AI model...' for 20-30 minutes and thinks the job
+    is stuck. This wrapper:
+      - detects whether weights are already cached
+      - if not, immediately emits 'Downloading model weights (~7 GB, one-time)...'
+      - runs the loader in a background thread
+      - every 20 s emits a heartbeat so the worker forwards a fresh
+        progressPhase and the admin page never sees a stale row.
+
+    Returns whatever the loader returned.
+    """
+    import threading, time, traceback
+    repo_id = args[0] if args else kwargs.get('pretrained_model_name_or_path')
+    cached = _hf_cache_has(repo_id) if repo_id else True
+    if not cached:
+        emit_progress(1, 'loading',
+                      detail='Downloading model weights (~7 GB, one-time)...')
+
+    result = {'val': None, 'err': None}
+    def _run():
+        try:
+            result['val'] = loader(*args, **kwargs)
+        except Exception:
+            result['err'] = traceback.format_exc()
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    started = time.time()
+    while t.is_alive():
+        t.join(timeout=20)
+        if t.is_alive():
+            elapsed = int(time.time() - started)
+            mins = elapsed // 60
+            if cached:
+                emit_progress(2, 'loading',
+                              detail=f'Loading model into VRAM... ({elapsed}s)')
+            else:
+                emit_progress(1, 'loading',
+                              detail=f'Still downloading model weights... ({mins}m elapsed)')
+    if result['err']:
+        raise RuntimeError(result['err'])
+    return result['val']
+
+
 class TqdmProgressHook:
     """
     Monkey-patches tqdm to capture volume decoding progress
@@ -165,7 +233,8 @@ def main():
     else:
         subfolder = 'hunyuan3d-dit-v2-0'
 
-    pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+    pipeline = from_pretrained_with_progress(
+        Hunyuan3DDiTFlowMatchingPipeline.from_pretrained,
         'tencent/Hunyuan3D-2',
         subfolder=subfolder,
         device='cuda',
@@ -220,7 +289,10 @@ def main():
         try:
             emit_progress(90, 'texturing', detail='Applying textures...')
             from hy3dgen.texgen import Hunyuan3DPaintPipeline
-            tex_pipeline = Hunyuan3DPaintPipeline.from_pretrained('tencent/Hunyuan3D-2')
+            tex_pipeline = from_pretrained_with_progress(
+                Hunyuan3DPaintPipeline.from_pretrained,
+                'tencent/Hunyuan3D-2',
+            )
             mesh = tex_pipeline(mesh, image=image)
             print('[generate.py] Texture generation done', flush=True)
         except Exception as e:
