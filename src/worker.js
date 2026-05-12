@@ -75,6 +75,28 @@ class Worker extends EventEmitter {
   async start() {
     console.log('[Worker] Starting poll loop...');
     await this.ensureTable();
+    // On startup, mark any "processing" rows still tagged to THIS worker
+    // as failed — they're orphans from a previous run that got SIGKILL'd.
+    // Otherwise they'd stay marked processing forever and confuse the
+    // OOM guard / admin UI.
+    try {
+      const orphaned = await this.pool.query(
+        `UPDATE genshape3d_jobs
+            SET status='failed',
+                "completedAt"=NOW(),
+                "updatedAt"=NOW(),
+                "progressPhase"='orphaned-by-worker-restart',
+                "errorMessage" = COALESCE(NULLIF("errorMessage", ''), 'worker process was restarted mid-job')
+          WHERE status='processing' AND "assignedWorkerId"=$1
+          RETURNING id`,
+        [this.workerId],
+      );
+      if (orphaned.rowCount > 0) {
+        console.log(`[Worker] Cleared ${orphaned.rowCount} orphan processing row(s) from previous run.`);
+      }
+    } catch (e) {
+      console.warn(`[Worker] Orphan cleanup failed (non-fatal): ${e.message}`);
+    }
     this.poll();
     this.pollTimer = setInterval(() => this.poll(), this.config.pollInterval);
   }
