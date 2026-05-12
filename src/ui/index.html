@@ -294,13 +294,17 @@
   <!-- Currently Processing (this worker) -->
   <div class="section" id="currentSection" style="display:none">
     <div class="section-title">This Worker - Active</div>
-    <div class="current-job">
-      <div class="label">Processing Now</div>
-      <div class="id" id="currentJobId"></div>
-      <div class="times" id="currentJobTimes"></div>
-      <div id="currentJobDetail"></div>
-      <div class="progress"><div class="progress-bar"></div></div>
-      <button class="btn-cancel" id="cancelCurrentBtn">Cancel Job</button>
+    <div class="current-job" style="display:flex;gap:14px;align-items:flex-start">
+      <div id="currentJobThumb"></div>
+      <div style="flex:1;min-width:0">
+        <div class="label">Processing Now</div>
+        <div id="currentJobName" style="font-size:15px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px"></div>
+        <div class="id" id="currentJobId"></div>
+        <div class="times" id="currentJobTimes"></div>
+        <div id="currentJobDetail"></div>
+        <div class="progress"><div class="progress-bar"></div></div>
+        <button class="btn-cancel" id="cancelCurrentBtn">Cancel Job</button>
+      </div>
     </div>
   </div>
 
@@ -367,6 +371,32 @@
       return id ? id.slice(0, 8) + '...' : '';
     }
 
+    // R2 endpoint URLs return 400 without auth — route through the i7
+    // server's /api/image proxy. Works from any machine on the LAN or
+    // via the public api.genshape3d.com host.
+    const API_BASE = 'https://api.genshape3d.com';
+    function thumbUrl(job) {
+      const url = job && (job.imageUrl || job.image_url);
+      if (!url) return '';
+      if (url.startsWith('/api/image')) return API_BASE + url;
+      if (url.includes('/uploads/')) {
+        const key = 'uploads/' + url.split('/uploads/')[1];
+        return API_BASE + '/api/image?key=' + encodeURIComponent(key);
+      }
+      return url;
+    }
+    function jobName(job) {
+      return (job && (job.name || '')).trim() || 'Untitled';
+    }
+    function thumbHtml(job, size) {
+      const u = thumbUrl(job);
+      const px = size || 48;
+      if (!u) {
+        return '<div style="width:' + px + 'px;height:' + px + 'px;border-radius:6px;background:#0f3460;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#5a6c80;font-size:11px">no img</div>';
+      }
+      return '<img src="' + u + '" alt="" style="width:' + px + 'px;height:' + px + 'px;object-fit:cover;border-radius:6px;background:#0f3460;flex-shrink:0" loading="lazy">';
+    }
+
     async function cancelJob(jobId) {
       if (!confirm(`Cancel job ${jobId.slice(0, 8)}...?`)) return;
       await window.api.cancelJob(jobId);
@@ -399,9 +429,11 @@
 
       const model = (job.model || 'hunyuan3d').toLowerCase();
       return `
-        <li class="job-item">
-          <div>
-            <div class="job-id">${shortId(job.id)}<span class="model-tag ${model}">${model}</span></div>
+        <li class="job-item" style="display:flex;gap:10px;align-items:flex-start">
+          ${thumbHtml(job, 48)}
+          <div style="flex:1;min-width:0">
+            <div style="font-weight:600;color:#e0e0e0;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${jobName(job)}</div>
+            <div class="job-id" style="font-size:11px;color:#5a6c80">${shortId(job.id)}<span class="model-tag ${model}">${model}</span></div>
             ${timeInfo}
           </div>
           <div class="job-right">
@@ -427,6 +459,8 @@
       if (state.currentJob) {
         section.style.display = '';
         const cjModel = (state.currentJob.model || 'hunyuan3d').toLowerCase();
+        document.getElementById('currentJobThumb').innerHTML = thumbHtml(state.currentJob, 80);
+        document.getElementById('currentJobName').textContent = jobName(state.currentJob);
         document.getElementById('currentJobId').innerHTML =
           `${state.currentJob.id}<span class="model-tag ${cjModel}">${cjModel}</span>`;
         const prog = state.currentJob.progress;
