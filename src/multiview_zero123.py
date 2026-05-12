@@ -86,12 +86,37 @@ def main() -> int:
     else:
         cols, rows = 3, 2
     cw, ch = W // cols, H // rows
+
+    # Background removal — Zero123++ leaves a solid grey backdrop, and
+    # Hunyuan3D-2-mv interprets that as geometry (it draws a hollow box
+    # around the subject). Run each saved view through the same
+    # BackgroundRemover Hunyuan3D itself uses, so the alpha channel
+    # tells the mv pipeline what's foreground.
+    bg_remover = None
+    try:
+        sys.path.insert(0, os.environ.get('HUNYUAN3D_DIR', r'C:/projects/ai/hunyuan3d/Hunyuan3D-2'))
+        try:
+            from hy3dgen import rembg as _rb
+        except ImportError:
+            from hy3dgen.shapegen import rembg as _rb
+        bg_remover = _rb.BackgroundRemover()
+    except Exception as e:
+        print(f'[mv] WARN: bg remover unavailable ({e}); views will keep grey backdrop', flush=True)
+
+    emit_progress(85, 'Removing backgrounds…')
     paths = {}
     for r in range(rows):
         for c in range(cols):
             i = r * cols + c
             crop = out.crop((c * cw, r * ch, (c + 1) * cw, (r + 1) * ch))
             label = INDEX_TO_LABEL.get(i, f'v{i}')
+            # rembg expects RGBA; convert if needed.
+            if bg_remover is not None and label in INDEX_TO_LABEL.values():
+                rgba = crop if crop.mode == 'RGBA' else crop.convert('RGBA')
+                try:
+                    crop = bg_remover(rgba)
+                except Exception as e:
+                    print(f'[mv] WARN: bg removal failed for {label} ({e}); using raw crop', flush=True)
             path = os.path.join(args.output_dir, f'{label}.png')
             crop.save(path)
             if label in INDEX_TO_LABEL.values():
