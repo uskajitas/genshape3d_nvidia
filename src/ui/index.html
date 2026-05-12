@@ -379,7 +379,7 @@
       if (!url) return '';
       if (url.startsWith('/api/image')) return API_BASE + url;
       // Match the most common R2 path prefixes our system writes.
-      const prefixes = ['/uploads/', '/mvtest/', '/outputs/'];
+      const prefixes = ['/uploads/', '/mvtest/', '/outputs/', '/mv-auto/'];
       for (const p of prefixes) {
         if (url.includes(p)) {
           const key = p.slice(1) + url.split(p)[1];
