@@ -103,6 +103,19 @@ def main() -> int:
     except Exception as e:
         print(f'[mv] WARN: bg remover unavailable ({e}); views will keep grey backdrop', flush=True)
 
+    def square_pad_resize(img, target=512):
+        """Center the subject on a transparent square canvas, then
+        downscale/upscale to `target` × `target`. Matches the roughly
+        square format Hunyuan3D-2-mv was trained on (Tencent's
+        example_mv_images are ~600 px square)."""
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+        w, h = img.size
+        side = max(w, h)
+        canvas = Image.new('RGBA', (side, side), (0, 0, 0, 0))
+        canvas.paste(img, ((side - w) // 2, (side - h) // 2))
+        return canvas.resize((target, target), Image.LANCZOS)
+
     emit_progress(85, 'Removing backgrounds…')
     paths = {}
     for r in range(rows):
@@ -117,6 +130,10 @@ def main() -> int:
                     crop = bg_remover(rgba)
                 except Exception as e:
                     print(f'[mv] WARN: bg removal failed for {label} ({e}); using raw crop', flush=True)
+            # Make every canonical aux view square + 512px so mv kernels
+            # see the shape they expect. Unmapped views (v3/v5) saved raw.
+            if label in INDEX_TO_LABEL.values():
+                crop = square_pad_resize(crop, 512)
             path = os.path.join(args.output_dir, f'{label}.png')
             crop.save(path)
             if label in INDEX_TO_LABEL.values():
