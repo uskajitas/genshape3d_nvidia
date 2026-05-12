@@ -190,6 +190,11 @@ def main():
     parser.add_argument('--target-face-count', type=int, default=100000, help='Target face count')
     parser.add_argument('--export-format', type=str, default='glb', help='Export format: glb, obj, ply, stl')
     parser.add_argument('--remove-bg', action='store_true', default=True, help='Remove background')
+    parser.add_argument(
+        '--aux-images', nargs='*', default=[],
+        help='Additional view images (side/back/three_q) for multi-view conditioning. '
+             'Used when the loaded Hunyuan3D variant supports a list input.',
+    )
     args = parser.parse_args()
 
     print(f'[generate.py] Loading image: {args.image}', flush=True)
@@ -209,10 +214,14 @@ def main():
     if image.mode != 'RGBA':
         image = image.convert('RGBA')
 
-    # Remove background
+    # Remove background. Upstream moved this module from
+    # `hy3dgen.shapegen.rembg` to `hy3dgen.rembg` in newer checkouts.
     if args.remove_bg:
         try:
-            from hy3dgen.shapegen import rembg
+            try:
+                from hy3dgen import rembg
+            except ImportError:
+                from hy3dgen.shapegen import rembg
             emit_progress(1, 'starting', detail='Processing image...')
             bg_remover = rembg.BackgroundRemover()
             image = bg_remover(image)
@@ -223,7 +232,23 @@ def main():
     hook = TqdmProgressHook()
     hook.install()
 
-    # Load shape generation pipeline
+    # Load shape generation pipeline — may take 20-30 min on first run
+    # (model weights download from HuggingFace). Emit heartbeats so the
+    # worker knows we're alive and the job doesn't look stuck.
+    import threading
+    _loading_done = threading.Event()
+
+    def _loading_heartbeat():
+        tick = 0
+        while not _loading_done.is_set():
+            _loading_done.wait(timeout=15)
+            if not _loading_done.is_set():
+                tick += 1
+                detail = 'Downloading model weights...' if tick < 10 else 'Loading model into GPU...'
+                emit_progress(2, 'loading', detail=detail)
+
+    threading.Thread(target=_loading_heartbeat, daemon=True).start()
+
     emit_progress(2, 'loading', detail='Loading AI model...')
     print('[generate.py] Loading shape generation pipeline...', flush=True)
     from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
@@ -242,6 +267,7 @@ def main():
         use_safetensors=True,
     )
 
+    _loading_done.set()
     emit_progress(5, 'loading', detail='Model ready, starting generation...')
 
     # Set up generator for seed
@@ -249,20 +275,56 @@ def main():
     if args.seed > 0:
         generator = torch.Generator(device='cuda').manual_seed(args.seed)
 
+    # Build the image input. If aux views were provided, pass a LIST to the
+    # pipeline (Hunyuan3D-2mv uses cross-view attention; the standard variant
+    # falls back to the first image). If aux loading or the pipeline call
+    # with a list fails, we retry with just the primary image.
+    pipeline_image = image
+    if args.aux_images:
+        aux_imgs = []
+        for p in args.aux_images:
+            try:
+                img = Image.open(p)
+                if img.mode != 'RGBA':
+                    img = img.convert('RGBA')
+                aux_imgs.append(img)
+            except Exception as e:
+                print(f'[generate.py] Skipping aux image {p}: {e}', flush=True)
+        if aux_imgs:
+            pipeline_image = [image] + aux_imgs
+            print(f'[generate.py] Using {len(aux_imgs)} aux view(s) (multi-view conditioning)', flush=True)
+
     # Generate mesh
     # The tqdm hook will emit progress for diffusion (5-15%) and volume decoding (15-85%)
     print(f'[generate.py] Generating 3D mesh ({args.steps} steps)...', flush=True)
     emit_progress(5, 'analyzing', step=0, total=args.steps, detail='Analyzing image...')
 
-    outputs = pipeline(
-        image=image,
-        num_inference_steps=args.steps,
-        guidance_scale=args.guidance_scale,
-        generator=generator,
-        octree_resolution=args.octree_resolution,
-        num_chunks=args.num_chunks,
-        output_type='mesh',
-    )
+    try:
+        outputs = pipeline(
+            image=pipeline_image,
+            num_inference_steps=args.steps,
+            guidance_scale=args.guidance_scale,
+            generator=generator,
+            octree_resolution=args.octree_resolution,
+            num_chunks=args.num_chunks,
+            output_type='mesh',
+        )
+    except (TypeError, ValueError) as e:
+        # Pipeline didn't accept a list input — retry single-view
+        if isinstance(pipeline_image, list):
+            print(f'[generate.py] Pipeline rejected multi-view input ({e}); '
+                  'falling back to single-view.', flush=True)
+            outputs = pipeline(
+                image=image,
+                num_inference_steps=args.steps,
+                guidance_scale=args.guidance_scale,
+                generator=generator,
+                octree_resolution=args.octree_resolution,
+                num_chunks=args.num_chunks,
+                output_type='mesh',
+            )
+        else:
+            raise
 
     # Convert Latent2MeshOutput to trimesh
     from hy3dgen.shapegen.pipelines import export_to_trimesh
