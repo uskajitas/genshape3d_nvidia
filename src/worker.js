@@ -353,7 +353,7 @@ class Worker extends EventEmitter {
       if (auxImagePaths.length === 0 && jobModelLower === 'hunyuan3d') {
         try {
           const generated = await this.generateLocalMultiView(inputImagePath, tmpDir, job.id);
-          if (generated.length > 0) {
+          if (generated.localPaths && generated.localPaths.length > 0) {
             auxImagePaths.push(...generated.localPaths);
             // Persist the R2 URLs so the admin trail (worker tray + admin
             // page) can show what views fed this 3D job.
