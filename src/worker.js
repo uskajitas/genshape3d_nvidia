@@ -334,6 +334,34 @@ class Worker extends EventEmitter {
         console.log(`[Worker] Using ${auxImagePaths.length} auxiliary view(s) for multi-view conditioning.`);
       }
 
+      // ── Local multi-view auto-generation ─────────────────────────
+      // If no aux views came in with the job, generate them right here
+      // on this machine using Zero123++ (no Replicate, no API). Only
+      // runs for hunyuan3d jobs (the only runner that uses multi-view
+      // input today) and only if the local Zero123++ weights are cached.
+      const jobModelLower = (job.model || 'hunyuan3d').toLowerCase();
+      if (auxImagePaths.length === 0 && jobModelLower === 'hunyuan3d') {
+        try {
+          const generated = await this.generateLocalMultiView(inputImagePath, tmpDir, job.id);
+          if (generated.length > 0) {
+            auxImagePaths.push(...generated.localPaths);
+            // Persist the R2 URLs so the admin trail (worker tray + admin
+            // page) can show what views fed this 3D job.
+            if (generated.r2Urls && generated.r2Urls.length > 0) {
+              await this.pool.query(
+                `UPDATE genshape3d_jobs SET "auxImageUrls" = $1::jsonb WHERE id = $2`,
+                [JSON.stringify(generated.r2Urls), job.id],
+              );
+              job.auxImageUrls = generated.r2Urls;
+              this.emit('stateChanged');
+            }
+            console.log(`[Worker] Auto-generated ${generated.localPaths.length} local view(s); attached to job.`);
+          }
+        } catch (err) {
+          console.warn(`[Worker] Local multi-view generation failed (continuing single-view): ${err.message}`);
+        }
+      }
+
       // Build Hunyuan3D params from job's generation settings
       const genParams = this.buildGenParams(job);
       console.log(`[Worker] Generation params:`, JSON.stringify(genParams));
@@ -498,6 +526,87 @@ class Worker extends EventEmitter {
     const filePath = path.join(tmpDir, `${baseName}${ext}`);
     fs.writeFileSync(filePath, buffer);
     return filePath;
+  }
+
+  /**
+   * Spawn the local Zero123++ runner (src/multiview_zero123.py) to
+   * generate 3 alt views from the primary image. Uploads each view to
+   * R2 so the admin trail (worker tray + webapp) can show them as the
+   * thumbnail strip under the input.
+   *
+   * Returns { localPaths: string[], r2Urls: string[] } — empty arrays
+   * on any failure (caller falls back to single-view).
+   */
+  async generateLocalMultiView(inputImagePath, tmpDir, jobId) {
+    const pythonCmd = process.env.PYTHON_CMD || 'python';
+    const scriptPath = path.join(__dirname, 'multiview_zero123.py');
+    const outDir = path.join(tmpDir, 'mv_views');
+    fs.mkdirSync(outDir, { recursive: true });
+
+    await this.updateProgress(jobId, {
+      pct: 2, phase: 'multiview', step: 0, total: 0,
+      detail: 'Generating alt views (Zero123++)...',
+    });
+
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn(pythonCmd, [scriptPath, '--image', inputImagePath, '--output-dir', outDir], {
+        cwd: path.dirname(scriptPath),
+        env: { ...process.env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', d => {
+        const text = d.toString();
+        stdout += text;
+        text.split('\n').filter(Boolean).forEach(line => {
+          if (line.startsWith('PROGRESS:')) {
+            try {
+              const prog = JSON.parse(line.slice(9));
+              this.updateProgress(jobId, prog).catch(() => {});
+            } catch {}
+          } else {
+            console.log(`[Zero123++] ${line}`);
+          }
+        });
+      });
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => {
+        if (code !== 0) return reject(new Error(`Zero123++ exit ${code}: ${stderr.slice(-300)}`));
+        const line = stdout.split('\n').find(l => l.startsWith('RESULT:'));
+        if (!line) return reject(new Error('Zero123++ produced no RESULT line'));
+        try {
+          const j = JSON.parse(line.slice(7));
+          if (j.status === 'error') return reject(new Error(j.error || 'Zero123++ error'));
+          resolve(j.views || {});
+        } catch (e) {
+          reject(new Error(`Could not parse Zero123++ result: ${e.message}`));
+        }
+      });
+      proc.on('error', err => reject(new Error(`Failed to spawn Zero123++: ${err.message}`)));
+    });
+
+    const localPaths = [];
+    const r2Urls = [];
+    for (const [label, localPath] of Object.entries(result)) {
+      if (!localPath || !fs.existsSync(localPath)) continue;
+      localPaths.push(localPath);
+      try {
+        const key = `mv-auto/${jobId}/${label}.png`;
+        const buf = fs.readFileSync(localPath);
+        await this.s3.send(new PutObjectCommand({
+          Bucket: this.config.r2Bucket,
+          Key: key,
+          Body: buf,
+          ContentType: 'image/png',
+        }));
+        const publicUrl = this.config.r2PublicUrl || `${this.config.r2Endpoint}/${this.config.r2Bucket}`;
+        r2Urls.push(`${publicUrl}/${key}`);
+      } catch (e) {
+        console.warn(`[Worker] Failed to upload generated view ${label}: ${e.message}`);
+      }
+    }
+    return { localPaths, r2Urls };
   }
 
   /**
