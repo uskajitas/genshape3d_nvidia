@@ -349,8 +349,16 @@ class Worker extends EventEmitter {
       // on this machine using Zero123++ (no Replicate, no API). Only
       // runs for hunyuan3d jobs (the only runner that uses multi-view
       // input today) and only if the local Zero123++ weights are cached.
+      //
+      // Disabled by default: Zero123++ produces inconsistent views on
+      // horizontally-posed subjects (quadrupeds, vehicles seen from
+      // above) and the resulting mv reconstruction comes out worse than
+      // single-image. The mv-trained variant of Hunyuan3D already does
+      // well on single-image input via its baked-in priors. Set
+      // ENABLE_AUTO_MULTIVIEW=true in the worker env to re-enable.
       const jobModelLower = (job.model || 'hunyuan3d').toLowerCase();
-      if (auxImagePaths.length === 0 && jobModelLower === 'hunyuan3d') {
+      const autoMvOn = (process.env.ENABLE_AUTO_MULTIVIEW || '').toLowerCase() === 'true';
+      if (autoMvOn && auxImagePaths.length === 0 && jobModelLower === 'hunyuan3d') {
         try {
           const generated = await this.generateLocalMultiView(inputImagePath, tmpDir, job.id);
           if (generated.localPaths && generated.localPaths.length > 0) {
