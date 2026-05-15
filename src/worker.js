@@ -297,9 +297,13 @@ class Worker extends EventEmitter {
         const nextJob = this._pendingForClaim.find(j => !j.requestCancel);
         if (nextJob) {
           // VRAM safety guard: two textured Hunyuan3D jobs together OOM
-          // a 24 GB card (each is ~6 GB shape + ~6 GB paint). Hold the
-          // pending one until the running one finishes.
-          const isTexHun = (j) => (j.model || 'hunyuan3d').toLowerCase() === 'hunyuan3d' && j.doTexture;
+          // a 24 GB card (each is ~6 GB shape + ~6 GB paint, and 2.1's PBR
+          // paint is heavier still). Hold the pending one until the running
+          // one finishes.
+          const isTexHun = (j) => {
+            const m = (j.model || 'hunyuan3d').toLowerCase();
+            return (m === 'hunyuan3d' || m === 'hunyuan3d-2-1') && j.doTexture;
+          };
           const oomRisk = isTexHun(nextJob) && this.processingJobs.some(isTexHun);
           if (oomRisk) {
             console.log(`[Worker] holding ${nextJob.id.slice(0,8)} — another textured-Hunyuan3D job is already running (would OOM).`);
