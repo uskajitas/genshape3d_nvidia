@@ -24,10 +24,10 @@ const _origLog = console.log.bind(console);
 const _origErr = console.error.bind(console);
 const _origWarn = console.warn.bind(console);
 function ts() { return new Date().toISOString(); }
-console.log  = (...a) => { logStream.write(`[${ts()}] ${a.join(' ')}\n`);    _origLog(...a); };
-console.warn = (...a) => { logStream.write(`[${ts()}] WARN ${a.join(' ')}\n`); _origWarn(...a); };
-console.error = (...a) => { logStream.write(`[${ts()}] ERROR ${a.join(' ')}\n`); _origErr(...a); };
-process.on('uncaughtException', (e) => { console.error('uncaughtException:', e && e.stack || e); });
+console.log  = (...a) => { logStream.write(`[${ts()}] ${a.join(' ')}\n`);    try { _origLog(...a); } catch {} };
+console.warn = (...a) => { logStream.write(`[${ts()}] WARN ${a.join(' ')}\n`); try { _origWarn(...a); } catch {} };
+console.error = (...a) => { logStream.write(`[${ts()}] ERROR ${a.join(' ')}\n`); try { _origErr(...a); } catch {} };
+process.on('uncaughtException', (e) => { if (e?.code === 'EPIPE') return; console.error('uncaughtException:', e && e.stack || e); });
 process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', e && e.stack || e); });
 console.log(`[main] Worker process started, WORKER_ID=${process.env.WORKER_ID}, logging to ${logPath}`);
 
