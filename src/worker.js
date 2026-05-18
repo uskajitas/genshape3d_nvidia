@@ -97,6 +97,23 @@ class Worker extends EventEmitter {
     } catch (e) {
       console.warn(`[Worker] Orphan cleanup failed (non-fatal): ${e.message}`);
     }
+    // Orphan cleanup for texture jobs
+    try {
+      const texOrphaned = await this.pool.query(
+        `UPDATE genshape3d_texture_jobs
+            SET status='failed', "completedAt"=NOW(), "updatedAt"=NOW(),
+                "progressPhase"='orphaned-by-worker-restart',
+                "errorMessage" = COALESCE(NULLIF("errorMessage", ''), 'worker process was restarted mid-job')
+          WHERE status='processing' AND "assignedWorkerId"=$1
+          RETURNING id`,
+        [this.workerId],
+      );
+      if (texOrphaned.rowCount > 0) {
+        console.log(`[Worker] Cleared ${texOrphaned.rowCount} orphan texture job(s) from previous run.`);
+      }
+    } catch (e) {
+      console.warn(`[Worker] Texture orphan cleanup failed (non-fatal): ${e.message}`);
+    }
     this.poll();
     this.pollTimer = setInterval(() => this.poll(), this.config.pollInterval);
   }
@@ -310,6 +327,26 @@ class Worker extends EventEmitter {
           } else {
             this.processJob(nextJob);
           }
+        }
+      }
+
+      // ── Texture jobs ──────────────────────────────────────────────────────
+      // Only pick up texture work when we have capacity and are not already
+      // running a shape job (texture paint is heavy on VRAM too).
+      if (this.activeCount < this.maxConcurrent) {
+        try {
+          const { rows: texPending } = await this.pool.query(
+            `SELECT * FROM genshape3d_texture_jobs
+             WHERE status = 'pending'
+             ORDER BY "createdAt" ASC
+             LIMIT 1`,
+          );
+          if (texPending.length > 0) {
+            console.log(`[Worker] Picking up texture job ${texPending[0].id.slice(0, 8)}`);
+            this.processTextureJob(texPending[0]);
+          }
+        } catch (texErr) {
+          console.warn(`[Worker] Texture job poll failed (non-fatal): ${texErr.message}`);
         }
       }
     } catch (err) {
@@ -937,6 +974,169 @@ else:
         reject(new Error(`Failed to spawn ${label} process: ${err.message}`));
       });
     });
+  }
+
+  /**
+   * Process a texture-only job from genshape3d_texture_jobs.
+   * Downloads the source GLB + reference image, runs hunyuan3d-2-1 in
+   * --texture-only mode, uploads the result, and marks the job done.
+   */
+  async processTextureJob(job) {
+    this.activeCount++;
+    let tmpDir;
+    try {
+      // Atomic claim — bail if another worker beat us to it
+      const claim = await this.pool.query(
+        `UPDATE genshape3d_texture_jobs
+            SET status='processing', "startedAt"=NOW(), "assignedWorkerId"=$1,
+                "updatedAt"=NOW(), "progressPct"=0, "progressPhase"='Preparing...'
+          WHERE id=$2 AND status='pending'`,
+        [this.workerId, job.id],
+      );
+      if (claim.rowCount === 0) {
+        console.log(`[TextureWorker] Job ${job.id.slice(0, 8)} already claimed, skipping.`);
+        this.activeCount--;
+        return;
+      }
+
+      const updateTexProgress = async (pct, phase) => {
+        try {
+          await this.pool.query(
+            `UPDATE genshape3d_texture_jobs
+                SET "progressPct"=$1, "progressPhase"=$2, "updatedAt"=NOW()
+              WHERE id=$3`,
+            [pct, phase, job.id],
+          );
+        } catch { /* non-fatal */ }
+      };
+
+      tmpDir = path.join(os.tmpdir(), `genshape3d-tex-${job.id}`);
+      fs.mkdirSync(tmpDir, { recursive: true });
+
+      // ── Download source mesh ───────────────────────────────────────────
+      await updateTexProgress(0, 'Downloading mesh...');
+      const meshPath = await this.downloadFromR2(job.sourceModelUrl, tmpDir, 'source_mesh');
+      console.log(`[TextureWorker] Downloaded mesh → ${meshPath}`);
+
+      // ── Download reference image ───────────────────────────────────────
+      let imagePath = null;
+      if (job.sourceImageUrl) {
+        await updateTexProgress(5, 'Downloading reference image...');
+        imagePath = await this.downloadFromR2(job.sourceImageUrl, tmpDir, 'ref_image');
+        console.log(`[TextureWorker] Downloaded ref image → ${imagePath}`);
+      }
+
+      // ── Resolve runner ─────────────────────────────────────────────────
+      const runnersDir = process.env.RUNNERS_DIR || 'C:/projects/genshape-worker-3090/runners';
+      const model = 'hunyuan3d-2-1';
+      const pythonCmd = path.join(runnersDir, model, '.venv', 'Scripts', 'python.exe');
+      const scriptPath = path.join(runnersDir, model, 'run.py');
+      const cwd = path.join(runnersDir, model);
+      const outputPath = path.join(tmpDir, 'textured_output.glb');
+
+      const args = [
+        scriptPath,
+        '--texture-only',
+        '--source-mesh', meshPath,
+        '--output', outputPath,
+      ];
+      if (imagePath) {
+        args.push('--image', imagePath);
+      }
+
+      await updateTexProgress(10, 'Loading paint pipeline...');
+      console.log(`[TextureWorker] Spawning: ${pythonCmd} ${args.slice(1).join(' ')}`);
+
+      // ── Run paint pipeline ─────────────────────────────────────────────
+      const stopGpu = this.startGpuSampler();
+      let glbPath;
+      try {
+        glbPath = await new Promise((resolve, reject) => {
+          const proc = spawn(pythonCmd, args, {
+            cwd,
+            env: { ...process.env },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          let stdout = '';
+          let stderr = '';
+          proc.stdout.on('data', data => {
+            const text = data.toString();
+            stdout += text;
+            text.split('\n').filter(Boolean).forEach(line => {
+              if (line.startsWith('PROGRESS:')) {
+                try {
+                  const p = JSON.parse(line.slice(9));
+                  updateTexProgress(p.pct || 0, p.detail || p.phase || '').catch(() => {});
+                } catch { /* ignore */ }
+              } else {
+                console.log(`[Hunyuan3DPaint] ${line}`);
+              }
+            });
+          });
+          proc.stderr.on('data', data => {
+            stderr += data.toString();
+            data.toString().split('\n').filter(Boolean).forEach(l =>
+              console.error(`[Hunyuan3DPaint ERR] ${l}`),
+            );
+          });
+          proc.on('close', code => {
+            if (code !== 0) {
+              return reject(new Error(`Paint process exited with code ${code}: ${stderr.slice(-500)}`));
+            }
+            const resultLine = stdout.split('\n').find(l => l.startsWith('RESULT:'));
+            if (resultLine) {
+              try {
+                const result = JSON.parse(resultLine.slice(7));
+                if (result.status === 'error') return reject(new Error(`Paint error: ${result.error}`));
+                const finalPath = result.output_path || outputPath;
+                if (!fs.existsSync(finalPath)) return reject(new Error(`Output not found: ${finalPath}`));
+                console.log(`[TextureWorker] Paint done in ${result.texture_time || result.total_time || '?'}s`);
+                return resolve(finalPath);
+              } catch (e) {
+                return reject(new Error(`Failed to parse paint result: ${e.message}`));
+              }
+            }
+            if (fs.existsSync(outputPath)) return resolve(outputPath);
+            reject(new Error(`Paint produced no output. stdout: ${stdout.slice(-300)}`));
+          });
+          proc.on('error', err => reject(new Error(`Failed to spawn paint process: ${err.message}`)));
+        });
+      } finally {
+        await stopGpu();
+      }
+
+      // ── Upload result ──────────────────────────────────────────────────
+      await updateTexProgress(95, 'Uploading textured model...');
+      const resultUrl = await this.uploadToR2(glbPath);
+      console.log(`[TextureWorker] Uploaded → ${resultUrl}`);
+
+      const completedAt = new Date().toISOString();
+      await this.pool.query(
+        `UPDATE genshape3d_texture_jobs
+            SET status='done', "resultUrl"=$1, "completedAt"=$2,
+                "progressPct"=100, "progressPhase"='Texturing complete!', "updatedAt"=NOW()
+          WHERE id=$3`,
+        [resultUrl, completedAt, job.id],
+      );
+      console.log(`[TextureWorker] Job ${job.id.slice(0, 8)} complete ✓`);
+
+    } catch (err) {
+      console.error(`[TextureWorker] Job ${job.id} failed:`, err.stack || err.message);
+      try {
+        await this.pool.query(
+          `UPDATE genshape3d_texture_jobs
+              SET status='failed', "completedAt"=NOW(), "progressPhase"='failed',
+                  "errorMessage"=$1, "updatedAt"=NOW()
+            WHERE id=$2`,
+          [(err.message || '').slice(0, 4000), job.id],
+        );
+      } catch { /* non-fatal */ }
+    } finally {
+      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+      this.activeCount--;
+      this.processing = this.activeCount > 0;
+      this.emit('stateChanged');
+    }
   }
 
   async uploadToR2(filePath) {
