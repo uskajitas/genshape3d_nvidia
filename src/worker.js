@@ -228,6 +228,15 @@ class Worker extends EventEmitter {
   }
 
   async poll() {
+    // Re-entrancy guard: setInterval fires on a wall-clock schedule
+    // regardless of whether the previous poll() has finished its DB
+    // awaits. Without this, two overlapping polls can both see the same
+    // pending job, both issue the claim UPDATE, and both waste a DB
+    // round-trip. The atomic WHERE status='pending' saves correctness,
+    // but the guard keeps things clean and predictable.
+    if (this._polling) return;
+    this._polling = true;
+
     // Heartbeat so we can confirm the loop is alive even when there's
     // nothing to claim. Logged once every ~30s of polling.
     this._pollCount = (this._pollCount || 0) + 1;
@@ -352,6 +361,8 @@ class Worker extends EventEmitter {
     } catch (err) {
       console.error('[Worker] Poll error:', err.message);
       console.error(err.stack);
+    } finally {
+      this._polling = false;
     }
   }
 
