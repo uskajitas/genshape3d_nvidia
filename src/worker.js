@@ -25,10 +25,14 @@ class Worker extends EventEmitter {
     super();
     this.config = config;
     this.workerId = WORKER_ID;
-    const isLocal = /@(localhost|127\.0\.0\.1)/.test(config.databaseUrl || '');
+    // Postgres runs plain TCP on the private LAN (no SSL) — both on the i7
+    // itself (127.0.0.1) and for LAN boxes (192.168.20.16). The trust
+    // boundary is the LAN, not TLS. Opt back into SSL only if DB_SSL=1.
+    const useSsl = process.env.DB_SSL === '1';
     this.pool = new Pool({
       connectionString: config.databaseUrl,
-      ssl: isLocal ? false : { rejectUnauthorized: false },
+      ssl: useSsl ? { rejectUnauthorized: false } : false,
+      keepAlive: true,
       max: 3,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000,
