@@ -326,17 +326,22 @@ class Worker extends EventEmitter {
       if (this.activeCount < this.maxConcurrent && this._pendingForClaim.length > 0) {
         const nextJob = this._pendingForClaim.find(j => !j.requestCancel);
         if (nextJob) {
-          // VRAM safety guard: two textured Hunyuan3D jobs together OOM
-          // a 24 GB card (each is ~6 GB shape + ~6 GB paint, and 2.1's PBR
-          // paint is heavier still). Hold the pending one until the running
-          // one finishes.
-          const isTexHun = (j) => {
+          // VRAM safety guard — heavy jobs get the GPU EXCLUSIVELY.
+          // "Heavy" = textured Hunyuan3D (2.0/2.1 shape+paint pipes) or
+          // hi3dgen (trellis pipeline). Any two heavy-ish pipelines sharing
+          // the 24 GB card exhaust VRAM; on Windows WDDM then silently spills
+          // to system RAM and both jobs crawl for hours at 99% GPU (this
+          // exact pairing — hi3dgen + textured-2.1 — cost a 12h hang).
+          // Rule: a heavy job can't start while ANYTHING else runs, and
+          // nothing can start while a heavy job runs.
+          const isHeavy = (j) => {
             const m = (j.model || 'hunyuan3d').toLowerCase();
-            return (m === 'hunyuan3d' || m === 'hunyuan3d-2-1') && j.doTexture;
+            return ((m === 'hunyuan3d' || m === 'hunyuan3d-2-1') && j.doTexture) || m === 'hi3dgen';
           };
-          const oomRisk = isTexHun(nextJob) && this.processingJobs.some(isTexHun);
-          if (oomRisk) {
-            console.log(`[Worker] holding ${nextJob.id.slice(0,8)} — another textured-Hunyuan3D job is already running (would OOM).`);
+          const heavyRunning = this.processingJobs.some(isHeavy);
+          const blocked = heavyRunning || (isHeavy(nextJob) && this.processingJobs.length > 0);
+          if (blocked) {
+            console.log(`[Worker] holding ${nextJob.id.slice(0,8)} — GPU exclusivity (heavy job running or queued job is heavy).`);
           } else {
             this.processJob(nextJob);
           }
@@ -344,9 +349,9 @@ class Worker extends EventEmitter {
       }
 
       // ── Texture jobs ──────────────────────────────────────────────────────
-      // Only pick up texture work when we have capacity and are not already
-      // running a shape job (texture paint is heavy on VRAM too).
-      if (this.activeCount < this.maxConcurrent) {
+      // Texture paint is heavy — same GPU-exclusivity rule as above: only
+      // pick one up when NOTHING else is running on this worker.
+      if (this.activeCount === 0) {
         try {
           const { rows: texPending } = await this.pool.query(
             `SELECT * FROM genshape3d_texture_jobs
@@ -881,6 +886,63 @@ else:
    * Same protocol as generate.py: PROGRESS:{...json...} on each step,
    * RESULT:{status, output_path, ...} at end.
    */
+  /**
+   * Hang watchdog for runner subprocesses.
+   *
+   * Why: a VRAM-exhausted CUDA process on Windows doesn't crash — WDDM spills
+   * to system RAM and the job "runs" at 99% GPU for hours with zero output
+   * (two 12h-stuck jobs cost a full night of generation). Progress lines are
+   * sparse during long steps, so liveness = ANY stdout/stderr output.
+   *
+   * Kills the process tree when EITHER:
+   *   - no output at all for STALL_TIMEOUT_MS   (default 15 min), or
+   *   - total runtime exceeds JOB_TIMEOUT_MS    (default 60 min).
+   * Both env-tunable. Killing makes proc 'close' with a signal → the normal
+   * failure path marks the job failed and frees the slot for the next job.
+   *
+   * Returns { touch, stop, killedWhy } — call touch() on every output chunk,
+   * stop() once the process closes; killedWhy() is set if we pulled the plug.
+   */
+  attachWatchdog(proc, label) {
+    const STALL_MS = parseInt(process.env.RUNNER_STALL_TIMEOUT_MS || String(15 * 60 * 1000), 10);
+    const HARD_MS  = parseInt(process.env.RUNNER_JOB_TIMEOUT_MS   || String(60 * 60 * 1000), 10);
+    const startedAt = Date.now();
+    let lastOutputAt = Date.now();
+    let killedWhy = null;
+
+    const killTree = (why) => {
+      killedWhy = why;
+      console.error(`[Watchdog] ${label} ${why} — killing PID ${proc.pid}`);
+      try {
+        if (process.platform === 'win32') {
+          // taskkill /T takes the whole tree (python may have spawned children)
+          spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore' });
+        } else {
+          proc.kill('SIGKILL');
+        }
+      } catch (e) {
+        console.error(`[Watchdog] kill failed: ${e.message}`);
+      }
+    };
+
+    const timer = setInterval(() => {
+      const now = Date.now();
+      if (now - startedAt > HARD_MS) {
+        killTree(`exceeded hard timeout (${Math.round(HARD_MS / 60000)} min)`);
+        clearInterval(timer);
+      } else if (now - lastOutputAt > STALL_MS) {
+        killTree(`no output for ${Math.round(STALL_MS / 60000)} min (hung — likely VRAM thrash)`);
+        clearInterval(timer);
+      }
+    }, 30 * 1000);
+
+    return {
+      touch: () => { lastOutputAt = Date.now(); },
+      stop: () => clearInterval(timer),
+      killedWhy: () => killedWhy,
+    };
+  }
+
   async callRunner(model, inputImagePath, tmpDir, genParams, auxImagePaths = []) {
     const ext = genParams.file_type || 'glb';
     const outputPath = path.join(tmpDir, `output.${ext}`);
@@ -921,11 +983,13 @@ else:
       });
 
       this.currentProc = proc;
+      const watchdog = this.attachWatchdog(proc, label);
 
       let stdout = '';
       let stderr = '';
 
       proc.stdout.on('data', (data) => {
+        watchdog.touch();
         const text = data.toString();
         stdout += text;
         text.split('\n').filter(Boolean).forEach(line => {
@@ -947,6 +1011,7 @@ else:
       });
 
       proc.stderr.on('data', (data) => {
+        watchdog.touch();
         const text = data.toString();
         stderr += text;
         text.split('\n').filter(Boolean).forEach(line => {
@@ -956,6 +1021,10 @@ else:
 
       proc.on('close', (code) => {
         this.currentProc = null;
+        watchdog.stop();
+        if (watchdog.killedWhy()) {
+          return reject(new Error(`${label} killed by watchdog: ${watchdog.killedWhy()}`));
+        }
         if (code !== 0) {
           return reject(new Error(`${label} process exited with code ${code}: ${stderr.slice(-500)}`));
         }
@@ -1072,9 +1141,11 @@ else:
             env: { ...process.env },
             stdio: ['ignore', 'pipe', 'pipe'],
           });
+          const watchdog = this.attachWatchdog(proc, 'Hunyuan3DPaint');
           let stdout = '';
           let stderr = '';
           proc.stdout.on('data', data => {
+            watchdog.touch();
             const text = data.toString();
             stdout += text;
             text.split('\n').filter(Boolean).forEach(line => {
@@ -1089,12 +1160,17 @@ else:
             });
           });
           proc.stderr.on('data', data => {
+            watchdog.touch();
             stderr += data.toString();
             data.toString().split('\n').filter(Boolean).forEach(l =>
               console.error(`[Hunyuan3DPaint ERR] ${l}`),
             );
           });
           proc.on('close', code => {
+            watchdog.stop();
+            if (watchdog.killedWhy()) {
+              return reject(new Error(`Paint killed by watchdog: ${watchdog.killedWhy()}`));
+            }
             if (code !== 0) {
               return reject(new Error(`Paint process exited with code ${code}: ${stderr.slice(-500)}`));
             }
