@@ -70,6 +70,8 @@ class Worker extends EventEmitter {
       completedJobs: this.completedJobs.slice(0, 20),
       failedJobs: this.failedJobs.slice(0, 20),
       cancelledJobs: this.cancelledJobs.slice(0, 20),
+      // All-time totals per status (the lists above are recent-only/capped)
+      counts: this.counts || null,
       isProcessing: this.processing,
       maxConcurrent: this.maxConcurrent,
       activeCount: this.activeCount,
@@ -273,29 +275,39 @@ class Worker extends EventEmitter {
       );
       this.processingJobs = processing;
 
-      // ── Cancelled — only this machine's ───────────────────────
+      // ── Recent lists — only this machine's, last 24h, capped ──────────────
+      // The lists are a "what happened recently" view, NOT full history —
+      // keeps the tray UI light no matter how many jobs accumulate. True
+      // all-time totals come from the counts query below.
+      const RECENT = `AND "completedAt"::timestamptz > NOW() - INTERVAL '24 hours'`;
+
       const { rows: cancelled } = await this.pool.query(
-        `SELECT * FROM genshape3d_jobs WHERE status = 'cancelled' AND "assignedWorkerId" = $1 ORDER BY "completedAt" DESC LIMIT 20`,
+        `SELECT * FROM genshape3d_jobs WHERE status = 'cancelled' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
         [this.workerId]
       );
       this.cancelledJobs = cancelled;
 
-      // ── Completed (done) — only this machine's ────────────────
-      // Sourced from the DB so history survives worker restarts. The
-      // in-memory unshift on jobComplete still happens but is now a
-      // best-effort cache, not the source of truth.
       const { rows: completed } = await this.pool.query(
-        `SELECT * FROM genshape3d_jobs WHERE status = 'done' AND "assignedWorkerId" = $1 ORDER BY "completedAt" DESC LIMIT 20`,
+        `SELECT * FROM genshape3d_jobs WHERE status = 'done' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
         [this.workerId]
       );
       this.completedJobs = completed;
 
-      // ── Failed — only this machine's ──────────────────────────
       const { rows: failed } = await this.pool.query(
-        `SELECT * FROM genshape3d_jobs WHERE status = 'failed' AND "assignedWorkerId" = $1 ORDER BY "completedAt" DESC LIMIT 20`,
+        `SELECT * FROM genshape3d_jobs WHERE status = 'failed' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
         [this.workerId]
       );
       this.failedJobs = failed;
+
+      // ── True all-time totals for the stat boxes ────────────────────────────
+      const { rows: countRows } = await this.pool.query(
+        `SELECT status, COUNT(*)::int AS n FROM genshape3d_jobs WHERE "assignedWorkerId" = $1 GROUP BY status`,
+        [this.workerId]
+      );
+      const counts = { done: 0, failed: 0, cancelled: 0, processing: 0 };
+      for (const r of countRows) if (r.status in counts) counts[r.status] = r.n;
+      counts.pending = this._pendingForClaim.length; // claimable by this worker
+      this.counts = counts;
 
       // Check for requestCancel from the web frontend
       if (this.currentJob) {
@@ -510,7 +522,7 @@ class Worker extends EventEmitter {
 
       let glbPath;
       try {
-        glbPath = await this.callRunner(model, inputImagePath, tmpDir, genParams, auxImagePaths);
+        glbPath = await this.callRunner(model, inputImagePath, tmpDir, genParams, auxImagePaths, job);
       } finally {
         const gpu = await stopGpu();
         try {
@@ -943,7 +955,7 @@ else:
     };
   }
 
-  async callRunner(model, inputImagePath, tmpDir, genParams, auxImagePaths = []) {
+  async callRunner(model, inputImagePath, tmpDir, genParams, auxImagePaths = [], job = null) {
     const ext = genParams.file_type || 'glb';
     const outputPath = path.join(tmpDir, `output.${ext}`);
     const { pythonCmd, scriptPath, cwd, env, label } = this.resolveRunner(model);
@@ -996,10 +1008,14 @@ else:
           if (line.startsWith('PROGRESS:')) {
             try {
               const progress = JSON.parse(line.slice(9));
-              if (this.currentJob) {
-                this.currentJob.progress = progress;
+              // Attribute progress to THIS runner's job. With MAX_CONCURRENT>1,
+              // this.currentJob is whichever job was claimed last — writing to
+              // it here would corrupt the other running job's progress.
+              const owner = job || this.currentJob;
+              if (owner) {
+                owner.progress = progress;
                 // Write progress to DB for the web frontend
-                this.updateProgress(this.currentJob.id, progress);
+                this.updateProgress(owner.id, progress);
                 this.emit('progressUpdate', progress);
                 this.emit('stateChanged');
               }

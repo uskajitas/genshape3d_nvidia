@@ -291,21 +291,10 @@
     </div>
   </div>
 
-  <!-- Currently Processing (this worker) -->
+  <!-- Currently Processing (this worker) — one card per active job -->
   <div class="section" id="currentSection" style="display:none">
     <div class="section-title">This Worker - Active</div>
-    <div class="current-job" style="display:flex;gap:14px;align-items:flex-start">
-      <div id="currentJobThumb"></div>
-      <div style="flex:1;min-width:0">
-        <div class="label">Processing Now</div>
-        <div id="currentJobName" style="font-size:15px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px"></div>
-        <div class="id" id="currentJobId"></div>
-        <div class="times" id="currentJobTimes"></div>
-        <div id="currentJobDetail"></div>
-        <div class="progress"><div class="progress-bar"></div></div>
-        <button class="btn-cancel" id="cancelCurrentBtn">Cancel Job</button>
-      </div>
-    </div>
+    <div id="activeJobsContainer"></div>
   </div>
 
   <!-- All processing jobs (including from other workers) -->
@@ -441,7 +430,7 @@
       if (statusClass === 'processing') {
         const phase = job.progressPhase || '';
         const pct = job.progressPct || 0;
-        timeInfo = `<div class="job-time">Started: ${formatTime(job.startedAt)} &mdash; Elapsed: ${formatDuration(job.startedAt)}</div>
+        timeInfo = `<div class="job-time">Started: ${formatTime(job.startedAt)} &mdash; Elapsed: <span class="elapsed-timer" data-started="${job.startedAt}">${formatDuration(job.startedAt)}</span></div>
                     <div class="job-duration" style="color:#00d2ff">${phase ? phase + ' &mdash; ' + pct + '%' : 'Starting...'}</div>
                     <div style="height:3px;background:#0f3460;border-radius:2px;margin-top:4px;overflow:hidden"><div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#00d2ff,#ff9800);transition:width 0.5s"></div></div>`;
       } else if (statusClass === 'done') {
@@ -494,61 +483,71 @@
 
     function update(state) {
       // Stats
-      document.getElementById('pendingCount').textContent = state.pendingJobs.length;
-      document.getElementById('processingCount').textContent = state.processingJobs.length;
-      document.getElementById('completedCount').textContent = state.completedJobs.length;
-      document.getElementById('failedCount').textContent = state.failedJobs.length;
+      // Stat boxes show TRUE all-time totals (the lists below are recent-only,
+      // capped at 20 — using their length here undercounted, e.g. "20 done").
+      const counts = state.counts || {};
+      document.getElementById('pendingCount').textContent = counts.pending ?? state.pendingJobs.length;
+      document.getElementById('processingCount').textContent = counts.processing ?? state.processingJobs.length;
+      document.getElementById('completedCount').textContent = counts.done ?? state.completedJobs.length;
+      document.getElementById('failedCount').textContent = counts.failed ?? state.failedJobs.length;
 
       // Status dot
       const dot = document.getElementById('statusDot');
       dot.className = state.isProcessing ? 'status-dot busy' : 'status-dot idle';
 
-      // Current job (this worker)
+      // Active jobs (this worker) — one card per running job. With
+      // MAX_CONCURRENT>1 the old single "currentJob" card hid the second job.
       const section = document.getElementById('currentSection');
-      if (state.currentJob) {
+      const active = state.processingJobs || [];
+      if (active.length > 0) {
         section.style.display = '';
-        const cj       = state.currentJob;
-        const cjModel  = (cj.model || 'hunyuan3d').toLowerCase();
-        const cjSteps  = cj.inferenceSteps ?? 0;
-        const cjHigh   = cjSteps > 10;
-        const cjTex    = !!cj.doTexture;
-        const cjOct    = cj.octreeResolution || 0;
-        const cjFaces  = cj.targetFaceCount || 0;
-        document.getElementById('currentJobThumb').innerHTML =
-          '<div style="display:flex;flex-direction:column;align-items:center;gap:6px">'
-          + thumbHtml(cj, 96)
-          + auxThumbsHtml(cj, 44)
-          + resultLinkHtml(cj)
-          + '</div>';
-        document.getElementById('currentJobName').textContent = jobName(cj);
-        document.getElementById('currentJobId').innerHTML =
-          `<div style="margin:4px 0 6px">
-            <span style="display:inline-block;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.04em;background:${cjTex?'#EC4899':'#374151'};color:${cjTex?'#fff':'#9CA3AF'};margin-right:5px">${cjTex?'TEXTURED':'NO TEXTURE'}</span>
-            <span style="display:inline-block;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.04em;background:${cjHigh?'#C084FC':'#374151'};color:${cjHigh?'#fff':'#9CA3AF'};margin-right:5px">${cjHigh?'HIGH':'STANDARD'}</span>
-            <span class="model-tag ${cjModel}">${cjModel}</span>
-          </div>
-          <div style="font-size:11px;color:#5a6c80;margin-bottom:4px">
-            ${cjSteps ? cjSteps + ' steps · ' : ''}${cjOct ? 'octree ' + cjOct : ''}${cjOct && cjFaces ? ' · ' : ''}${cjFaces ? (cjFaces/1000).toFixed(0) + 'k faces target' : ''}
-          </div>
-          <div style="font-family:Consolas,monospace;font-size:11px;color:#5a6c80">${cj.id}</div>`;
-        const prog = state.currentJob.progress;
-        const bar = document.querySelector('.progress-bar');
-        const detailEl = document.getElementById('currentJobDetail');
-        if (prog && prog.pct > 0) {
-          bar.style.animation = 'none';
-          bar.style.width = prog.pct + '%';
-          bar.style.transition = 'width 0.5s ease';
-          detailEl.innerHTML = `<span class="progress-detail">${prog.detail || prog.phase} &mdash; ${prog.pct}%</span>`;
-        } else {
-          bar.style.animation = '';
-          bar.style.width = '';
-          detailEl.innerHTML = '<span class="progress-detail">Starting...</span>';
-        }
-        document.getElementById('currentJobTimes').innerHTML =
-          `Started: <span>${formatTime(state.currentJob.startedAt)}</span> &mdash; Elapsed: <span>${formatDuration(state.currentJob.startedAt)}</span>`;
-        document.getElementById('cancelCurrentBtn').onclick = () => cancelJob(state.currentJob.id);
+        document.getElementById('activeJobsContainer').innerHTML = active.map(cj => {
+          const cjModel  = (cj.model || 'hunyuan3d').toLowerCase();
+          const cjSteps  = cj.inferenceSteps ?? 0;
+          const cjHigh   = cjSteps > 10;
+          const cjTex    = !!cj.doTexture;
+          const cjOct    = cj.octreeResolution || 0;
+          const cjFaces  = cj.targetFaceCount || 0;
+          // Progress: live in-memory for the job the tray process owns; DB
+          // columns (progressPct/progressPhase) for the rest — same numbers,
+          // just written by the runner via updateProgress().
+          const pct    = (state.currentJob && state.currentJob.id === cj.id && state.currentJob.progress)
+            ? state.currentJob.progress.pct : (cj.progressPct || 0);
+          const detail = (state.currentJob && state.currentJob.id === cj.id && state.currentJob.progress)
+            ? (state.currentJob.progress.detail || state.currentJob.progress.phase) : (cj.progressPhase || '');
+          return `
+          <div class="current-job" style="display:flex;gap:14px;align-items:flex-start;margin-bottom:10px">
+            <div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:6px">
+                ${thumbHtml(cj, 96)}${auxThumbsHtml(cj, 44)}${resultLinkHtml(cj)}
+              </div>
+            </div>
+            <div style="flex:1;min-width:0">
+              <div class="label">Processing Now</div>
+              <div style="font-size:15px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px">${jobName(cj)}</div>
+              <div class="id">
+                <div style="margin:4px 0 6px">
+                  <span style="display:inline-block;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.04em;background:${cjTex?'#EC4899':'#374151'};color:${cjTex?'#fff':'#9CA3AF'};margin-right:5px">${cjTex?'TEXTURED':'NO TEXTURE'}</span>
+                  <span style="display:inline-block;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.04em;background:${cjHigh?'#C084FC':'#374151'};color:${cjHigh?'#fff':'#9CA3AF'};margin-right:5px">${cjHigh?'HIGH':'STANDARD'}</span>
+                  <span class="model-tag ${cjModel}">${cjModel}</span>
+                </div>
+                <div style="font-size:11px;color:#5a6c80;margin-bottom:4px">
+                  ${cjSteps ? cjSteps + ' steps · ' : ''}${cjOct ? 'octree ' + cjOct : ''}${cjOct && cjFaces ? ' · ' : ''}${cjFaces ? (cjFaces/1000).toFixed(0) + 'k faces target' : ''}
+                </div>
+                <div style="font-family:Consolas,monospace;font-size:11px;color:#5a6c80">${cj.id}</div>
+              </div>
+              <div class="times">Started: <span>${formatTime(cj.startedAt)}</span> &mdash; Elapsed: <span class="elapsed-timer" data-started="${cj.startedAt}">${formatDuration(cj.startedAt)}</span></div>
+              <div>${pct > 0
+                ? `<span class="progress-detail">${detail} &mdash; ${pct}%</span>`
+                : '<span class="progress-detail">Starting...</span>'}</div>
+              <div class="progress"><div class="progress-bar" style="${pct > 0 ? `animation:none;width:${pct}%;transition:width 0.5s ease` : ''}"></div></div>
+              <button class="btn-cancel" onclick="cancelJob('${cj.id}')">Cancel Job</button>
+            </div>
+          </div>`;
+        }).join('');
       } else {
         section.style.display = 'none';
+        document.getElementById('activeJobsContainer').innerHTML = '';
       }
 
       // Processing jobs (from DB)
@@ -582,13 +581,17 @@
     // Initial load
     window.api.getState().then(update);
 
-    // Live updates from main process
+    // Live updates from main process — full re-render only on real state changes
     window.api.onJobUpdate(update);
 
-    // Refresh elapsed timers every second when processing
-    setInterval(() => {
-      window.api.getState().then(update);
-    }, 1000);
+    // Lightweight elapsed-timer tick — patches only the elapsed spans in place,
+    // never touches list innerHTML so images do not flicker or reload.
+    function tickElapsed() {
+      document.querySelectorAll('.elapsed-timer[data-started]').forEach(function (el) {
+        el.textContent = formatDuration(el.getAttribute('data-started'));
+      });
+    }
+    setInterval(tickElapsed, 1000);
   </script>
 </body>
 </html>
