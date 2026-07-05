@@ -9,6 +9,14 @@ const { app, Tray, Menu, BrowserWindow, Notification, ipcMain, nativeImage } = r
 const fs = require('fs');
 const { Worker } = require('./worker');
 
+// ── Single instance ──────────────────────────────────────────────────────────
+// A scheduled task relaunches the worker every few minutes as a keep-alive.
+// This lock makes that safe: if a worker is already running, the new launch
+// exits immediately instead of double-claiming jobs.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+}
+
 // ── Persistent log file ──────────────────────────────────────────────────────
 // Always write console output to a file in the repo root so that failures are
 // inspectable even when Electron was launched by Task Scheduler (which throws

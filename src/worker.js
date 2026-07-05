@@ -266,6 +266,36 @@ class Worker extends EventEmitter {
         [models, this.workerId]
       );
       this._pendingForClaim = pending;
+
+      // ── Stale-pending takeover ─────────────────────────────────
+      // Guarantee: no job sits pending forever just because it was routed to
+      // a worker that's offline. If a pending job addressed to ANOTHER worker
+      // has waited > TAKEOVER_AFTER_MIN (default 10) and this machine can run
+      // its model, we claim it. Env-gated (TAKEOVER_STALE_PENDING=true in the
+      // 3090's .env) so the 1080 — which can't run textured/hi3dgen work —
+      // never steals jobs it would hang on. Textured jobs are additionally
+      // excluded unless this machine lists hunyuan3d-2-1 (a texture-capable
+      // stack implies the paint pipeline fits in VRAM).
+      if ((process.env.TAKEOVER_STALE_PENDING || '').toLowerCase() === 'true') {
+        const afterMin = parseInt(process.env.TAKEOVER_AFTER_MIN || '10', 10);
+        const canTexture = models.includes('hunyuan3d-2-1');
+        const { rows: stale } = await this.pool.query(
+          `SELECT * FROM genshape3d_jobs
+           WHERE status = 'pending'
+             AND model = ANY($1::text[])
+             AND "preferredWorkerId" <> '' AND "preferredWorkerId" IS NOT NULL
+             AND "preferredWorkerId" <> $2
+             AND "createdAt"::timestamptz < NOW() - ($3 || ' minutes')::interval
+             ${canTexture ? '' : 'AND "doTexture" = false'}
+           ORDER BY "createdAt" ASC`,
+          [models, this.workerId, afterMin]
+        );
+        if (stale.length > 0) {
+          console.log(`[Worker] taking over ${stale.length} stale pending job(s) addressed to an offline worker.`);
+          this._pendingForClaim.push(...stale);
+        }
+      }
+
       this.pendingJobs = [];
 
       // ── Processing — only this machine's ──────────────────────
