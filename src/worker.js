@@ -275,6 +275,18 @@ class Worker extends EventEmitter {
       );
       this.processingJobs = processing;
 
+      // Heartbeat: bump updatedAt on our running jobs every poll. The server's
+      // stuck-job sweeper requeues 'processing' rows whose updatedAt is stale
+      // >30 min — runners can legitimately go long stretches without PROGRESS
+      // lines (paint step), so without this a healthy job could get requeued
+      // out from under us. With it, staleness == this worker is actually dead.
+      if (processing.length > 0) {
+        await this.pool.query(
+          `UPDATE genshape3d_jobs SET "updatedAt" = NOW() WHERE status = 'processing' AND "assignedWorkerId" = $1`,
+          [this.workerId]
+        ).catch(() => { /* non-fatal */ });
+      }
+
       // ── Recent lists — only this machine's, last 24h, capped ──────────────
       // The lists are a "what happened recently" view, NOT full history —
       // keeps the tray UI light no matter how many jobs accumulate. True
