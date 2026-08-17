@@ -124,6 +124,23 @@ class Worker extends EventEmitter {
     } catch (e) {
       console.warn(`[Worker] Texture orphan cleanup failed (non-fatal): ${e.message}`);
     }
+    // Orphan cleanup for refine jobs
+    try {
+      const refOrphaned = await this.pool.query(
+        `UPDATE genshape3d_refine_jobs
+            SET status='failed', "completedAt"=NOW(), "updatedAt"=NOW(),
+                "progressPhase"='orphaned-by-worker-restart',
+                "errorMessage" = COALESCE(NULLIF("errorMessage", ''), 'worker process was restarted mid-job')
+          WHERE status='processing' AND "assignedWorkerId"=$1
+          RETURNING id`,
+        [this.workerId],
+      );
+      if (refOrphaned.rowCount > 0) {
+        console.log(`[Worker] Cleared ${refOrphaned.rowCount} orphan refine job(s) from previous run.`);
+      }
+    } catch (e) {
+      console.warn(`[Worker] Refine orphan cleanup failed (non-fatal): ${e.message}`);
+    }
     this.poll();
     this.pollTimer = setInterval(() => this.poll(), this.config.pollInterval);
 
@@ -487,6 +504,26 @@ class Worker extends EventEmitter {
           }
         } catch (texErr) {
           console.warn(`[Worker] Texture job poll failed (non-fatal): ${texErr.message}`);
+        }
+      }
+
+      // ── Refine jobs (mesh repair/retopo) ──────────────────────────────────
+      // CPU-only and fast (~10 s) but keep the same only-when-idle gate for
+      // simplicity — the queue drains quickly anyway.
+      if (this.activeCount === 0) {
+        try {
+          const { rows: refPending } = await this.pool.query(
+            `SELECT * FROM genshape3d_refine_jobs
+             WHERE status = 'pending' AND deleted = false
+             ORDER BY "createdAt" ASC
+             LIMIT 1`,
+          );
+          if (refPending.length > 0) {
+            console.log(`[Worker] Picking up refine job ${refPending[0].id.slice(0, 8)}`);
+            this.processRefineJob(refPending[0]);
+          }
+        } catch (refErr) {
+          console.warn(`[Worker] Refine job poll failed (non-fatal): ${refErr.message}`);
         }
       }
     } catch (err) {
@@ -1347,6 +1384,165 @@ else:
       try {
         await this.pool.query(
           `UPDATE genshape3d_texture_jobs
+              SET status='failed', "completedAt"=NOW(), "progressPhase"='failed',
+                  "errorMessage"=$1, "updatedAt"=NOW()
+            WHERE id=$2`,
+          [(err.message || '').slice(0, 4000), job.id],
+        );
+      } catch { /* non-fatal */ }
+    } finally {
+      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+      this.activeCount--;
+      this.processing = this.activeCount > 0;
+      this.emit('stateChanged');
+    }
+  }
+
+  /**
+   * Process a mesh refine job from genshape3d_refine_jobs. Downloads the
+   * source GLB, runs refine.py (weld / floaters / holes / normals /
+   * optional decimate) in the hunyuan3d-2-1 venv, uploads the result, and
+   * inserts a NEW genshape3d_jobs row so the clean mesh appears as a
+   * normal derivative asset. The source job is never touched.
+   */
+  async processRefineJob(job) {
+    this.activeCount++;
+    let tmpDir;
+    try {
+      const claim = await this.pool.query(
+        `UPDATE genshape3d_refine_jobs
+            SET status='processing', "startedAt"=NOW(), "assignedWorkerId"=$1,
+                "updatedAt"=NOW(), "progressPct"=0, "progressPhase"='Preparing...'
+          WHERE id=$2 AND status='pending'`,
+        [this.workerId, job.id],
+      );
+      if (claim.rowCount === 0) {
+        console.log(`[RefineWorker] Job ${job.id.slice(0, 8)} already claimed, skipping.`);
+        this.activeCount--;
+        return;
+      }
+
+      const updateProgress = async (pct, phase) => {
+        try {
+          await this.pool.query(
+            `UPDATE genshape3d_refine_jobs
+                SET "progressPct"=$1, "progressPhase"=$2, "updatedAt"=NOW() WHERE id=$3`,
+            [pct, phase, job.id],
+          );
+        } catch { /* non-fatal */ }
+      };
+
+      tmpDir = path.join(os.tmpdir(), `genshape3d-refine-${job.id}`);
+      fs.mkdirSync(tmpDir, { recursive: true });
+
+      await updateProgress(2, 'Downloading mesh...');
+      const meshPath = await this.downloadFromR2(job.sourceModelUrl, tmpDir, 'source_mesh');
+
+      const ops = typeof job.operations === 'string' ? JSON.parse(job.operations) : (job.operations || {});
+      const runnersDir = process.env.RUNNERS_DIR || 'C:/projects/genshape-worker-3090/runners';
+      const runnerDir = path.join(runnersDir, 'hunyuan3d-2-1');
+      const pythonCmd = path.join(runnerDir, '.venv', 'Scripts', 'python.exe');
+      const outputPath = path.join(tmpDir, 'refined.glb');
+
+      const args = [
+        path.join(runnerDir, 'refine.py'),
+        '--input', meshPath,
+        '--output', outputPath,
+        '--target-faces', String(ops.targetFaces || 0),
+        '--keep-frac', String(ops.keepFrac || 0.02),
+        '--smooth', String(ops.smooth || 0),
+      ];
+      if (ops.fillHoles === false) args.push('--no-fill-holes');
+
+      console.log(`[RefineWorker] Spawning: ${pythonCmd} ${args.slice(1).join(' ')}`);
+      let stats = {};
+      await new Promise((resolve, reject) => {
+        const proc = spawn(pythonCmd, args, {
+          cwd: runnerDir,
+          env: { ...process.env },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        const watchdog = this.attachWatchdog(proc, 'Refine');
+        let stdout = '', stderr = '';
+        proc.stdout.on('data', data => {
+          watchdog.touch();
+          const text = data.toString();
+          stdout += text;
+          text.split('\n').filter(Boolean).forEach(line => {
+            if (line.startsWith('PROGRESS:')) {
+              try {
+                const p = JSON.parse(line.slice(9));
+                updateProgress(p.pct || 0, p.detail || p.phase || '').catch(() => {});
+              } catch { /* ignore */ }
+            } else if (!line.startsWith('RESULT:')) {
+              console.log(`[Refine] ${line}`);
+            }
+          });
+        });
+        proc.stderr.on('data', data => {
+          watchdog.touch();
+          stderr += data.toString();
+        });
+        proc.on('close', code => {
+          watchdog.stop();
+          if (watchdog.killedWhy()) return reject(new Error(`Refine killed by watchdog: ${watchdog.killedWhy()}`));
+          if (code !== 0) return reject(new Error(`Refine exited ${code}: ${stderr.slice(-400)}`));
+          const resultLine = stdout.split('\n').find(l => l.startsWith('RESULT:'));
+          if (resultLine) {
+            try { stats = JSON.parse(resultLine.slice(7)); } catch { /* keep {} */ }
+          }
+          if (!fs.existsSync(outputPath)) return reject(new Error('Refine produced no output file'));
+          resolve();
+        });
+        proc.on('error', err => reject(new Error(`Failed to spawn refine: ${err.message}`)));
+      });
+
+      await updateProgress(95, 'Uploading refined mesh...');
+      const resultUrl = await this.uploadToR2(outputPath);
+
+      // Insert the derivative asset. Name mirrors the source; model 'refine'
+      // marks provenance and keeps it out of GPU model routing.
+      const { rows: srcRows } = await this.pool.query(
+        `SELECT name, "imageUrl", "userEmail" FROM genshape3d_jobs WHERE id=$1`, [job.sourceJobId],
+      );
+      const src = srcRows[0] || {};
+      const newJobId = crypto.randomUUID();
+      const nowIso = new Date().toISOString();
+      const faceNote = stats.faces_out ? ` ${Math.round(stats.faces_out / 1000)}k` : '';
+      await this.pool.query(
+        `INSERT INTO genshape3d_jobs
+           (id, "userEmail", "imageUrl", name, prompt, style, status, "resultUrl",
+            "createdAt", "updatedAt", "startedAt", "completedAt",
+            model, "assignedWorkerId", "doTexture", "progressPct", "progressPhase")
+         VALUES ($1, $2, $3, $4, $5, 'Realistic', 'done', $6, $7, $7, NOW(), NOW(),
+                 'refine', $8, false, 100, 'done')`,
+        [
+          newJobId,
+          job.userEmail,
+          src.imageUrl || '',
+          `${(src.name || 'Asset').slice(0, 48)} · refined${faceNote}`,
+          `Refined mesh (weld, floaters, holes, normals${(stats.faces_out && stats.faces_in && stats.faces_out < stats.faces_in) ? `, decimated ${stats.faces_in}→${stats.faces_out}` : ''})`,
+          resultUrl,
+          nowIso,
+          this.workerId,
+        ],
+      );
+
+      await this.pool.query(
+        `UPDATE genshape3d_refine_jobs
+            SET status='done', "resultUrl"=$1, "resultJobId"=$2, stats=$3,
+                "progressPct"=100, "progressPhase"='Refine complete!',
+                "completedAt"=NOW(), "updatedAt"=NOW()
+          WHERE id=$4`,
+        [resultUrl, newJobId, JSON.stringify(stats), job.id],
+      );
+      console.log(`[RefineWorker] Job ${job.id.slice(0, 8)} complete -> asset ${newJobId.slice(0, 8)} (${stats.faces_in}->${stats.faces_out} faces, ${stats.floaters_removed} floaters removed)`);
+
+    } catch (err) {
+      console.error(`[RefineWorker] Job ${job.id} failed:`, err.stack || err.message);
+      try {
+        await this.pool.query(
+          `UPDATE genshape3d_refine_jobs
               SET status='failed', "completedAt"=NOW(), "progressPhase"='failed',
                   "errorMessage"=$1, "updatedAt"=NOW()
             WHERE id=$2`,
