@@ -330,7 +330,31 @@ class Worker extends EventEmitter {
         `SELECT * FROM genshape3d_jobs WHERE status = 'processing' AND "assignedWorkerId" = $1 ORDER BY "startedAt" ASC`,
         [this.workerId]
       );
-      this.processingJobs = processing;
+      // Texture jobs live in their own table but must ALSO appear here:
+      // the tray UI renders this list (otherwise it says "processing 0"
+      // during a paint), and isHeavy() below reads it for GPU exclusivity
+      // (otherwise a mesh job could start mid-paint).
+      const { rows: texProcessing } = await this.pool.query(
+        `SELECT * FROM genshape3d_texture_jobs WHERE status = 'processing' AND "assignedWorkerId" = $1 ORDER BY "startedAt" ASC`,
+        [this.workerId]
+      );
+      this.processingJobs = [
+        ...processing,
+        ...texProcessing.map(t => ({
+          id: t.id,
+          name: `[TEX] ${t.materialPreset && t.materialPreset !== 'Auto' ? t.materialPreset : (t.prompt || 'texture')}`.slice(0, 60),
+          model: 'hunyuan3d-2-1',
+          doTexture: true,
+          isTexture: true,
+          status: 'processing',
+          progressPct: t.progressPct,
+          progressPhase: t.progressPhase,
+          startedAt: t.startedAt,
+          createdAt: t.createdAt,
+          imageUrl: t.sourceImageUrl || '',
+          userEmail: t.userEmail,
+        })),
+      ];
 
       // Heartbeat: bump updatedAt on our running jobs every poll. The server's
       // stuck-job sweeper requeues 'processing' rows whose updatedAt is stale
