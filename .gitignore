@@ -1,5 +1,7 @@
 node_modules/
 .env
-.env.bak.*
+worker.log
+worker.log.*
 dist/
-*.log
+# one-off DB diagnostic scripts (throwaway)
+_*.js
