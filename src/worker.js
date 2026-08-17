@@ -29,17 +29,21 @@ class Worker extends EventEmitter {
     // itself (127.0.0.1) and for LAN boxes (192.168.20.16). The trust
     // boundary is the LAN, not TLS. Opt back into SSL only if DB_SSL=1.
     const useSsl = process.env.DB_SSL === '1';
-    this.pool = new Pool({
-      connectionString: config.databaseUrl,
-      ssl: useSsl ? { rejectUnauthorized: false } : false,
-      keepAlive: true,
-      max: 3,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
-    });
-    this.pool.on('error', (err) => {
-      console.error('[Worker] Pool error (will reconnect):', err.message);
-    });
+    this._makePool = () => {
+      const pool = new Pool({
+        connectionString: config.databaseUrl,
+        ssl: useSsl ? { rejectUnauthorized: false } : false,
+        keepAlive: true,
+        max: 3,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000,
+      });
+      pool.on('error', (err) => {
+        console.error('[Worker] Pool error (will reconnect):', err.message);
+      });
+      return pool;
+    };
+    this.pool = this._makePool();
     this.s3 = new S3Client({
       region: 'auto',
       endpoint: config.r2Endpoint,
@@ -122,6 +126,28 @@ class Worker extends EventEmitter {
     }
     this.poll();
     this.pollTimer = setInterval(() => this.poll(), this.config.pollInterval);
+
+    // Stuck-poll watchdog. After a DB outage, pg-pool can end up with every
+    // client stuck: the next pool.query() waits forever for a free client,
+    // `_polling` never resets, and every later tick returns instantly — the
+    // worker looks alive but silently stops claiming jobs forever (this
+    // exact failure ate an afternoon of texture jobs on 2026-08-17). If a
+    // single poll has been "in flight" for over 3 minutes, destroy the pool,
+    // build a fresh one, and let the loop resume.
+    this.pollWatchdogTimer = setInterval(() => {
+      if (this._polling && this._pollStartedAt && Date.now() - this._pollStartedAt > 180000) {
+        console.error('[Worker] Poll stuck for >3min — resetting DB pool and poll state.');
+        this.resetPool();
+        this._polling = false;
+      }
+    }, 60000);
+  }
+
+  resetPool() {
+    const old = this.pool;
+    this.pool = this._makePool();
+    if (old) old.end().catch(() => { /* already broken */ });
+    console.log('[Worker] DB pool recreated.');
   }
 
   async ensureTable() {
@@ -242,6 +268,7 @@ class Worker extends EventEmitter {
     // but the guard keeps things clean and predictable.
     if (this._polling) return;
     this._polling = true;
+    this._pollStartedAt = Date.now();
 
     // Heartbeat so we can confirm the loop is alive even when there's
     // nothing to claim. Logged once every ~30s of polling.
@@ -424,6 +451,11 @@ class Worker extends EventEmitter {
     } catch (err) {
       console.error('[Worker] Poll error:', err.message);
       console.error(err.stack);
+      // Connection-class errors poison the pool's clients — recreate it now
+      // instead of letting the next poll hang on a dead client.
+      if (/timeout|terminat|ECONNRESET|ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT/i.test(err.message || '')) {
+        this.resetPool();
+      }
     } finally {
       this._polling = false;
     }
