@@ -333,28 +333,30 @@ class Worker extends EventEmitter {
       // Texture jobs live in their own table but must ALSO appear here:
       // the tray UI renders this list (otherwise it says "processing 0"
       // during a paint), and isHeavy() below reads it for GPU exclusivity
-      // (otherwise a mesh job could start mid-paint).
+      // (otherwise a mesh job could start mid-paint). mapTexJob converts a
+      // texture row to the job-card shape shared with regular jobs.
+      const mapTexJob = (t) => ({
+        id: t.id,
+        name: `[TEX] ${t.materialPreset && t.materialPreset !== 'Auto' ? t.materialPreset : (t.prompt || 'texture')}`.slice(0, 60),
+        model: 'hunyuan3d-2-1',
+        doTexture: true,
+        isTexture: true,
+        status: t.status,
+        progressPct: t.progressPct,
+        progressPhase: t.progressPhase,
+        startedAt: t.startedAt,
+        completedAt: t.completedAt,
+        createdAt: t.createdAt,
+        imageUrl: t.sourceImageUrl || '',
+        resultUrl: t.resultUrl || '',
+        errorMessage: t.errorMessage || '',
+        userEmail: t.userEmail,
+      });
       const { rows: texProcessing } = await this.pool.query(
         `SELECT * FROM genshape3d_texture_jobs WHERE status = 'processing' AND "assignedWorkerId" = $1 ORDER BY "startedAt" ASC`,
         [this.workerId]
       );
-      this.processingJobs = [
-        ...processing,
-        ...texProcessing.map(t => ({
-          id: t.id,
-          name: `[TEX] ${t.materialPreset && t.materialPreset !== 'Auto' ? t.materialPreset : (t.prompt || 'texture')}`.slice(0, 60),
-          model: 'hunyuan3d-2-1',
-          doTexture: true,
-          isTexture: true,
-          status: 'processing',
-          progressPct: t.progressPct,
-          progressPhase: t.progressPhase,
-          startedAt: t.startedAt,
-          createdAt: t.createdAt,
-          imageUrl: t.sourceImageUrl || '',
-          userEmail: t.userEmail,
-        })),
-      ];
+      this.processingJobs = [...processing, ...texProcessing.map(mapTexJob)];
 
       // Heartbeat: bump updatedAt on our running jobs every poll. The server's
       // stuck-job sweeper requeues 'processing' rows whose updatedAt is stale
@@ -380,17 +382,32 @@ class Worker extends EventEmitter {
       );
       this.cancelledJobs = cancelled;
 
+      // Finished paints join the history lists (they used to vanish once
+      // done). mapTexJob is defined next to the processing merge above.
+      const byCompletedDesc = (a, b) =>
+        new Date(b.completedAt || 0).getTime() - new Date(a.completedAt || 0).getTime();
+
       const { rows: completed } = await this.pool.query(
         `SELECT * FROM genshape3d_jobs WHERE status = 'done' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
         [this.workerId]
       );
-      this.completedJobs = completed;
+      const { rows: texCompleted } = await this.pool.query(
+        `SELECT * FROM genshape3d_texture_jobs WHERE status = 'done' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
+        [this.workerId]
+      );
+      this.completedJobs = [...completed, ...texCompleted.map(mapTexJob)]
+        .sort(byCompletedDesc).slice(0, 20);
 
       const { rows: failed } = await this.pool.query(
         `SELECT * FROM genshape3d_jobs WHERE status = 'failed' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
         [this.workerId]
       );
-      this.failedJobs = failed;
+      const { rows: texFailed } = await this.pool.query(
+        `SELECT * FROM genshape3d_texture_jobs WHERE status = 'failed' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
+        [this.workerId]
+      );
+      this.failedJobs = [...failed, ...texFailed.map(mapTexJob)]
+        .sort(byCompletedDesc).slice(0, 20);
 
       // ── True all-time totals for the stat boxes ────────────────────────────
       const { rows: countRows } = await this.pool.query(
