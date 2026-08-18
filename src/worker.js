@@ -478,7 +478,7 @@ class Worker extends EventEmitter {
           // nothing can start while a heavy job runs.
           const isHeavy = (j) => {
             const m = (j.model || 'hunyuan3d').toLowerCase();
-            return ((m === 'hunyuan3d' || m === 'hunyuan3d-2-1') && j.doTexture) || m === 'hi3dgen';
+            return ((m === 'hunyuan3d' || m === 'hunyuan3d-2-1') && j.doTexture) || m === 'hi3dgen' || m === 'trellis2';
           };
           const heavyRunning = this.processingJobs.some(isHeavy);
           const blocked = heavyRunning || (isHeavy(nextJob) && this.processingJobs.length > 0);

@@ -1,0 +1,52 @@
+# TRELLIS.2-4B (microsoft/TRELLIS.2) — native Windows via prebuilt wheels.
+#
+# Upstream is Linux-only (six custom CUDA extensions). visualbruno's
+# ComfyUI-Trellis2 repo ships Windows cp311 wheels built against
+# torch 2.7.0+cu128 — we reuse those in ./wheels/ (downloaded from
+# github.com/visualbruno/ComfyUI-Trellis2 wheels/Windows/Torch270).
+#
+# Setup:
+#   py -3.11 -m venv .venv
+#   .\.venv\Scripts\python.exe -m pip install torch==2.7.0 torchvision==0.22.0 \
+#       --index-url https://download.pytorch.org/whl/cu128
+#   .\.venv\Scripts\python.exe -m pip install xformers==0.0.30 --no-deps
+#   .\.venv\Scripts\python.exe -m pip install wheels\*.whl
+#   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Code repo (not pip-installed; run.py sys.path's it):
+#   git clone --depth 1 https://github.com/microsoft/TRELLIS.2 C:\projects\ai\trellis2\TRELLIS.2
+#
+# ⚠ Gated HF models — one-time license acceptance + HF token required:
+#   facebook/dinov3-vitl16-pretrain-lvd1689m  (image conditioning)
+#   briaai/RMBG-2.0                           (background removal)
+# Set HF_TOKEN in the worker env once Juan accepts both on huggingface.co.
+#
+# Attention: no flash-attn on Windows/sm86 → ATTN_BACKEND=xformers +
+# SPARSE_ATTN_BACKEND=xformers (set in run.py). Sparse conv: flex_gemm wheel.
+
+# flex_gemm's spconv kernels are Triton; official triton has no Windows
+# wheels — triton-windows (woct0rdho's build) is the community standard.
+# 3.3.x pairs with torch 2.7.
+triton-windows<3.4
+
+# inference deps (mirrors setup.sh --basic minus demo/training extras)
+imageio
+imageio-ffmpeg
+tqdm
+easydict
+opencv-python-headless
+ninja
+trimesh
+# trellis2's DinoV3FeatureExtractor walks DINOv3ViTModel internals
+# (.layer, .rope_embeddings) — transformers 5.x renamed them. Stay on 4.57.
+transformers==4.57.1
+safetensors
+huggingface_hub
+plyfile
+zstandard
+kornia
+timm
+einops
+scipy
+pillow
+numpy
