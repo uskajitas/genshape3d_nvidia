@@ -213,6 +213,9 @@ class Worker extends EventEmitter {
         ['"progressStep"',   'INTEGER NOT NULL DEFAULT 0'],
         ['"progressTotal"',  'INTEGER NOT NULL DEFAULT 0'],
         ['"requestCancel"',  'BOOLEAN NOT NULL DEFAULT false'],
+        ['"rootJobId"',      "TEXT NOT NULL DEFAULT ''"],
+        ['version',          'INTEGER NOT NULL DEFAULT 1'],
+        ['"versionLabel"',   "TEXT NOT NULL DEFAULT ''"],
         ['"errorMessage"',   "TEXT NOT NULL DEFAULT ''"],
         ['"octreeResolution"', 'INTEGER NOT NULL DEFAULT 0'],
         ['"targetFaceCount"',  'INTEGER NOT NULL DEFAULT 0'],
@@ -1501,31 +1504,45 @@ else:
       await updateProgress(95, 'Uploading refined mesh...');
       const resultUrl = await this.uploadToR2(outputPath);
 
-      // Insert the derivative asset. Name mirrors the source; model 'refine'
-      // marks provenance and keeps it out of GPU model routing.
+      // Insert the derivative as a new VERSION of the source's lineage —
+      // same asset identity (rootJobId), same name, incremented version.
+      // model 'refine' marks provenance and keeps it out of GPU routing.
       const { rows: srcRows } = await this.pool.query(
-        `SELECT name, "imageUrl", "userEmail" FROM genshape3d_jobs WHERE id=$1`, [job.sourceJobId],
+        `SELECT name, "imageUrl", "userEmail", "rootJobId" FROM genshape3d_jobs WHERE id=$1`,
+        [job.sourceJobId],
       );
       const src = srcRows[0] || {};
+      const rootJobId = src.rootJobId || job.sourceJobId;
+      const { rows: verRows } = await this.pool.query(
+        `SELECT COALESCE(MAX(version), 1) + 1 AS next FROM genshape3d_jobs WHERE "rootJobId" = $1`,
+        [rootJobId],
+      );
+      const nextVersion = verRows[0]?.next || 2;
+      const ops2 = typeof job.operations === 'string' ? JSON.parse(job.operations) : (job.operations || {});
+      const faceNote = stats.faces_out ? ` ${Math.round(stats.faces_out / 1000)}k` : '';
+      const versionLabel = `${ops2.rebuild ? 'rebuilt' : 'refined'}${faceNote}`;
       const newJobId = crypto.randomUUID();
       const nowIso = new Date().toISOString();
-      const faceNote = stats.faces_out ? ` ${Math.round(stats.faces_out / 1000)}k` : '';
       await this.pool.query(
         `INSERT INTO genshape3d_jobs
            (id, "userEmail", "imageUrl", name, prompt, style, status, "resultUrl",
             "createdAt", "updatedAt", "startedAt", "completedAt",
-            model, "assignedWorkerId", "doTexture", "progressPct", "progressPhase")
+            model, "assignedWorkerId", "doTexture", "progressPct", "progressPhase",
+            "rootJobId", version, "versionLabel")
          VALUES ($1, $2, $3, $4, $5, 'Realistic', 'done', $6, $7, $7, NOW(), NOW(),
-                 'refine', $8, false, 100, 'done')`,
+                 'refine', $8, false, 100, 'done', $9, $10, $11)`,
         [
           newJobId,
           job.userEmail,
           src.imageUrl || '',
-          `${(src.name || 'Asset').slice(0, 48)} · refined${faceNote}`,
-          `Refined mesh (weld, floaters, holes, normals${(stats.faces_out && stats.faces_in && stats.faces_out < stats.faces_in) ? `, decimated ${stats.faces_in}→${stats.faces_out}` : ''})`,
+          (src.name || 'Asset').slice(0, 60),
+          `Refined mesh (weld, floaters, holes, normals${(stats.faces_out && stats.faces_in && stats.faces_out < stats.faces_in) ? `, ${stats.faces_in}→${stats.faces_out} faces` : ''})`,
           resultUrl,
           nowIso,
           this.workerId,
+          rootJobId,
+          nextVersion,
+          versionLabel,
         ],
       );
 
