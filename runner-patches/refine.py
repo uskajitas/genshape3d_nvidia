@@ -137,6 +137,55 @@ def taubin_smooth(mesh: trimesh.Trimesh, iterations: int) -> trimesh.Trimesh:
     )
 
 
+
+
+def unwrap_and_bake(mesh: trimesh.Trimesh, bake_source: trimesh.Trimesh | None,
+                    out_path: str, stats: dict) -> None:
+    """Give the refined mesh a fresh UV layout (xatlas) and bake maps into it:
+    a tangent-space normal map from the pre-decimation source (so the lower
+    face count keeps the original's surface detail) and AO. Falls back to a
+    plain clay export if anything in the chain fails."""
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    try:
+        import xatlas
+        progress(88, "uv", "Unwrapping UVs (xatlas)...")
+        vmapping, indices, uvs = xatlas.parametrize(
+            np.asarray(mesh.vertices, dtype=np.float32),
+            np.asarray(mesh.faces, dtype=np.uint32),
+        )
+        unwrapped = trimesh.Trimesh(
+            vertices=np.asarray(mesh.vertices)[vmapping],
+            faces=indices.astype(np.int64),
+            process=False,
+        )
+        unwrapped.visual = trimesh.visual.TextureVisuals(
+            uv=uvs,
+            material=trimesh.visual.material.PBRMaterial(
+                baseColorFactor=[0.78, 0.78, 0.8, 1.0], metallicFactor=0.0, roughnessFactor=0.85,
+            ),
+        )
+        unwrapped.export(out_path)
+        stats["uv_unwrapped"] = True
+
+        from bake_ao import rasterize_uv, bake_normal_map, bake_ao, attach_orm_to_glb
+        res = 1024
+        pos, nrm, valid, fid = rasterize_uv(unwrapped, res)
+        normal_img = None
+        if bake_source is not None and len(bake_source.faces) > len(unwrapped.faces) * 1.02:
+            progress(92, "bake", "Baking normal map from high-poly source...")
+            normal_img = bake_normal_map(unwrapped, bake_source, pos, nrm, valid, fid)
+            stats["normal_baked_from_faces"] = int(len(bake_source.faces))
+        progress(95, "bake", "Baking ambient occlusion...")
+        ao = bake_ao(unwrapped, res, 24, 0.3)
+        attach_orm_to_glb(out_path, out_path, ao, None, None, normal_img)
+        stats["ao_baked"] = True
+    except Exception as e:
+        log(f"unwrap/bake failed (exporting plain mesh): {e}")
+        mesh.visual = trimesh.visual.ColorVisuals(mesh)
+        mesh.export(out_path)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
@@ -148,6 +197,8 @@ def main() -> int:
     ap.add_argument("--no-fill-holes", action="store_true")
     ap.add_argument("--rebuild", action="store_true",
                     help="TRUE retopology: Poisson surface reconstruction from scratch")
+    ap.add_argument("--no-bake", action="store_true",
+                    help="skip UV unwrap + normal/AO bake on the refined mesh")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -166,6 +217,7 @@ def main() -> int:
         mesh, floaters = remove_floaters(mesh, args.keep_frac)
         stats["floaters_removed"] = int(floaters)
         stats["degenerate_removed"] = 0
+        bake_source = mesh.copy()  # pre-rebuild detail for the normal bake
         progress(35, "retopo", "Rebuilding surface (Poisson)...")
         mesh = rebuild_surface(mesh, args.target_faces or 40000)
         # Trimming Poisson's low-support membranes can reopen the surface —
@@ -185,9 +237,12 @@ def main() -> int:
         stats["faces_out"] = int(len(mesh.faces))
         stats["vertices_out"] = int(len(mesh.vertices))
         stats["watertight"] = bool(mesh.is_watertight)
-        progress(92, "exporting", "Exporting GLB...")
-        mesh.visual = trimesh.visual.ColorVisuals(mesh)
-        mesh.export(args.output)
+        if args.no_bake:
+            progress(92, "exporting", "Exporting GLB...")
+            mesh.visual = trimesh.visual.ColorVisuals(mesh)
+            mesh.export(args.output)
+        else:
+            unwrap_and_bake(mesh, bake_source, args.output, stats)
         stats["time"] = round(time.time() - t0, 1)
         log(f"rebuilt: {stats['faces_in']}->{stats['faces_out']} faces, "
             f"watertight={stats['watertight']}, {stats['time']}s")
@@ -224,6 +279,7 @@ def main() -> int:
     except Exception as e:
         log(f"normal repair partial: {e}")
 
+    bake_source = mesh.copy()  # pre-decimation detail for the normal bake
     if args.target_faces > 0 and len(mesh.faces) > args.target_faces:
         progress(75, "retopo", f"Decimating to {args.target_faces} faces...")
         mesh = decimate(mesh, args.target_faces)
@@ -237,9 +293,12 @@ def main() -> int:
     stats["vertices_out"] = int(len(mesh.vertices))
     stats["watertight"] = bool(mesh.is_watertight)
 
-    progress(92, "exporting", "Exporting GLB...")
-    mesh.visual = trimesh.visual.ColorVisuals(mesh)  # plain clay, no stale UV/material
-    mesh.export(args.output)
+    if args.no_bake:
+        progress(92, "exporting", "Exporting GLB...")
+        mesh.visual = trimesh.visual.ColorVisuals(mesh)  # plain clay
+        mesh.export(args.output)
+    else:
+        unwrap_and_bake(mesh, bake_source, args.output, stats)
 
     stats["time"] = round(time.time() - t0, 1)
     log(f"refined: {stats['faces_in']}->{stats['faces_out']} faces, "

@@ -46,6 +46,16 @@ def pick_mesh(path: str) -> trimesh.Trimesh:
     return max(meshes, key=lambda m: len(m.faces))
 
 
+def load_any_mesh(path: str) -> trimesh.Trimesh:
+    """Load the largest mesh regardless of UVs (normal-bake sources are raw
+    shape meshes without a UV layout)."""
+    loaded = trimesh.load(path, force="scene", process=False)
+    meshes = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+    if not meshes:
+        raise RuntimeError("no mesh found in source")
+    return max(meshes, key=lambda m: len(m.faces))
+
+
 def rasterize_uv(mesh: trimesh.Trimesh, res: int):
     """Return per-texel world position, normal, and a valid mask (res x res)."""
     uv = np.asarray(mesh.visual.uv, dtype=np.float64)
@@ -55,13 +65,14 @@ def rasterize_uv(mesh: trimesh.Trimesh, res: int):
 
     pos = np.zeros((res, res, 3), dtype=np.float64)
     nrm = np.zeros((res, res, 3), dtype=np.float64)
+    fid = np.full((res, res), -1, dtype=np.int64)
     valid = np.zeros((res, res), dtype=bool)
 
     # Image space: x = u * res, y = (1 - v) * res  (glTF top-left origin).
     px = uv[:, 0] * (res - 1)
     py = (1.0 - uv[:, 1]) * (res - 1)
 
-    for f in faces:
+    for f_index, f in enumerate(faces):
         xs, ys = px[f], py[f]
         x0, x1 = int(np.floor(xs.min())), int(np.ceil(xs.max()))
         y0, y1 = int(np.floor(ys.min())), int(np.ceil(ys.max()))
@@ -94,9 +105,10 @@ def rasterize_uv(mesh: trimesh.Trimesh, res: int):
         n = w0 * vnorm[f[0]] + w1 * vnorm[f[1]] + w2 * vnorm[f[2]]
         n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
         nrm[yy, xx] = n
+        fid[yy, xx] = f_index
         valid[yy, xx] = True
 
-    return pos, nrm, valid
+    return pos, nrm, valid, fid
 
 
 def cosine_hemisphere(n_samples: int) -> np.ndarray:
@@ -110,7 +122,7 @@ def cosine_hemisphere(n_samples: int) -> np.ndarray:
 
 def bake_ao(mesh: trimesh.Trimesh, res: int, samples: int, max_dist_frac: float):
     t0 = time.time()
-    pos, nrm, valid = rasterize_uv(mesh, res)
+    pos, nrm, valid, _fid = rasterize_uv(mesh, res)
     n_texels = int(valid.sum())
     log(f"rasterized UV: {n_texels} texels covered ({time.time()-t0:.1f}s)")
 
@@ -177,6 +189,110 @@ def bake_ao(mesh: trimesh.Trimesh, res: int, samples: int, max_dist_frac: float)
     return np.clip(ao, 0.0, 1.0)
 
 
+def face_tangents(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Per-face tangent vectors from UV gradients (standard TBN construction)."""
+    uv = np.asarray(mesh.visual.uv, dtype=np.float64)
+    v = np.asarray(mesh.vertices)
+    f = mesh.faces
+    p0, p1, p2 = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    u0, u1, u2 = uv[f[:, 0]], uv[f[:, 1]], uv[f[:, 2]]
+    e1, e2 = p1 - p0, p2 - p0
+    d1, d2 = u1 - u0, u2 - u0
+    det = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
+    det = np.where(np.abs(det) < 1e-12, 1e-12, det)
+    r = (1.0 / det)[:, None]
+    t = (e1 * d2[:, 1][:, None] - e2 * d1[:, 1][:, None]) * r
+    n = np.linalg.norm(t, axis=1, keepdims=True)
+    return t / np.maximum(n, 1e-12)
+
+
+def bake_normal_map(
+    low_mesh: trimesh.Trimesh, high_mesh: trimesh.Trimesh,
+    pos: np.ndarray, nrm: np.ndarray, valid: np.ndarray, fid: np.ndarray,
+) -> np.ndarray:
+    """Transfer the high-poly mesh's surface normals onto the low mesh's UV
+    layout as a tangent-space normal map. For every covered texel: closest
+    point on the high mesh -> barycentric-interpolated high normal ->
+    express in the texel's TBN frame. Texels too far from the high surface
+    (UV seams, mismatched regions) fall back to flat (0.5, 0.5, 1)."""
+    import open3d as o3d
+    res = pos.shape[0]
+
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(
+        o3d.core.Tensor(np.asarray(high_mesh.vertices, dtype=np.float32)),
+        o3d.core.Tensor(np.asarray(high_mesh.faces, dtype=np.uint32)),
+    )
+    hv_norm = np.asarray(high_mesh.vertex_normals)
+    hf = high_mesh.faces
+
+    P = pos[valid].astype(np.float32)
+    N = nrm[valid]
+    F = fid[valid]
+    ans = scene.compute_closest_points(o3d.core.Tensor(P))
+    prim = ans["primitive_ids"].numpy().astype(np.int64)
+    puv = ans["primitive_uvs"].numpy().astype(np.float64)
+    closest = ans["points"].numpy().astype(np.float64)
+
+    # Interpolate high-mesh vertex normals with the barycentric coordinates.
+    tri = hf[prim]
+    w0 = (1.0 - puv[:, 0] - puv[:, 1])[:, None]
+    w1 = puv[:, 0][:, None]
+    w2 = puv[:, 1][:, None]
+    hn = w0 * hv_norm[tri[:, 0]] + w1 * hv_norm[tri[:, 1]] + w2 * hv_norm[tri[:, 2]]
+    hn /= np.maximum(np.linalg.norm(hn, axis=1, keepdims=True), 1e-12)
+
+    # Reject transfers across too large a gap (different parts of the mesh).
+    diag = float(np.linalg.norm(low_mesh.bounds[1] - low_mesh.bounds[0]))
+    too_far = np.linalg.norm(closest - P.astype(np.float64), axis=1) > diag * 0.025
+    # Also reject opposing normals (front face matched to back face).
+    flipped = np.einsum("ij,ij->i", hn, N) < 0.0
+    bad = too_far | flipped
+    hn[bad] = N[bad]
+
+    # Tangent frame per texel from the low mesh's face tangents.
+    tangents = face_tangents(low_mesh)
+    T = tangents[F]
+    T = T - N * np.einsum("ij,ij->i", T, N)[:, None]
+    T /= np.maximum(np.linalg.norm(T, axis=1, keepdims=True), 1e-12)
+    B = np.cross(N, T)
+
+    ts = np.stack([
+        np.einsum("ij,ij->i", hn, T),
+        np.einsum("ij,ij->i", hn, B),
+        np.einsum("ij,ij->i", hn, N),
+    ], axis=1)
+    ts /= np.maximum(np.linalg.norm(ts, axis=1, keepdims=True), 1e-12)
+
+    img = np.zeros((res, res, 3), dtype=np.float32)
+    img[..., 0] = 0.5
+    img[..., 1] = 0.5
+    img[..., 2] = 1.0
+    img[valid] = ts * 0.5 + 0.5
+
+    # Edge dilation (same reason as AO): bleed valid texels outward so
+    # bilinear sampling at UV island borders doesn't hit flat/blank texels.
+    v = valid.copy()
+    for _ in range(4):
+        inv = ~v
+        acc = np.zeros((res, res, 3), dtype=np.float32)
+        cnt = np.zeros((res, res), dtype=np.float32)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                src_v = np.roll(np.roll(v, dy, axis=0), dx, axis=1)
+                src_i = np.roll(np.roll(img, dy, axis=0), dx, axis=1)
+                m = inv & src_v
+                acc[m] += src_i[m]
+                cnt[m] += 1.0
+        newly = inv & (cnt > 0)
+        img[newly] = acc[newly] / cnt[newly][:, None]
+        v = v | newly
+
+    return np.clip(img, 0.0, 1.0)
+
+
 def _load_gray(path: str | None, res: int) -> np.ndarray | None:
     if not path:
         return None
@@ -188,9 +304,25 @@ def _load_gray(path: str | None, res: int) -> np.ndarray | None:
         return None
 
 
+def _append_png(glb, blob_holder, img: Image.Image, name: str) -> int:
+    """Append a PNG image to the GLB binary blob; returns its texture index."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    png = buf.getvalue()
+    blob = blob_holder[0]
+    pad = (-len(blob)) % 4
+    offset = len(blob) + pad
+    blob_holder[0] = blob + b"\x00" * pad + png
+    glb.bufferViews.append(BufferView(buffer=0, byteOffset=offset, byteLength=len(png)))
+    glb.images.append(GltfImage(bufferView=len(glb.bufferViews) - 1, mimeType="image/png", name=name))
+    glb.textures.append(Texture(source=len(glb.images) - 1, name=name))
+    return len(glb.textures) - 1
+
+
 def attach_orm_to_glb(
     glb_path: str, out_path: str, ao: np.ndarray,
     metallic_path: str | None = None, roughness_path: str | None = None,
+    normal_img: np.ndarray | None = None,
 ) -> None:
     """Pack ORM (R=AO, G=roughness, B=metallic) into ONE texture appended to
     the GLB, referenced as both occlusionTexture and (when M/R maps exist)
@@ -208,47 +340,66 @@ def attach_orm_to_glb(
     if b is None:
         b = np.zeros((res, res), dtype=np.uint8)
 
-    orm = np.stack([r, g, b], axis=2)
-    buf = io.BytesIO()
-    Image.fromarray(orm, mode="RGB").save(buf, format="PNG")
-    png = buf.getvalue()
-
     glb = GLTF2().load(glb_path)
-    blob = glb.binary_blob()
-    # 4-byte alignment for the appended chunk
-    pad = (-len(blob)) % 4
-    offset = len(blob) + pad
-    glb.set_binary_blob(blob + b"\x00" * pad + png)
-    glb.buffers[0].byteLength = offset + len(png)
+    blob_holder = [glb.binary_blob()]
 
-    glb.bufferViews.append(BufferView(buffer=0, byteOffset=offset, byteLength=len(png)))
-    glb.images.append(GltfImage(bufferView=len(glb.bufferViews) - 1, mimeType="image/png", name="orm"))
-    glb.textures.append(Texture(source=len(glb.images) - 1, name="orm"))
-    tex_index = len(glb.textures) - 1
+    orm = np.stack([r, g, b], axis=2)
+    tex_index = _append_png(glb, blob_holder, Image.fromarray(orm, mode="RGB"), "orm")
+
+    normal_index = None
+    if normal_img is not None:
+        normal_index = _append_png(
+            glb, blob_holder,
+            Image.fromarray((normal_img * 255).astype(np.uint8), mode="RGB"), "normal")
+
+    glb.set_binary_blob(blob_holder[0])
+    glb.buffers[0].byteLength = len(blob_holder[0])
+
+    from pygltflib import TextureInfo, NormalMaterialTexture
     for mat in glb.materials:
         mat.occlusionTexture = OcclusionTextureInfo(index=tex_index, strength=1.0)
         if has_mr and mat.pbrMetallicRoughness is not None:
-            from pygltflib import TextureInfo
             mat.pbrMetallicRoughness.metallicRoughnessTexture = TextureInfo(index=tex_index, texCoord=0)
             # The texture now carries the values — factors become multipliers.
             mat.pbrMetallicRoughness.metallicFactor = 1.0
             mat.pbrMetallicRoughness.roughnessFactor = 1.0
+        if normal_index is not None:
+            mat.normalTexture = NormalMaterialTexture(index=normal_index, scale=1.0)
     glb.save(out_path)
-    log(f"ORM attached (AO{' + metallic/roughness' if has_mr else ' only'})")
+    log(f"ORM attached (AO{' + metallic/roughness' if has_mr else ' only'}{' + normal' if normal_index is not None else ''})")
 
 
 def finalize(
     glb_in: str, glb_out: str,
     metallic_path: str | None = None, roughness_path: str | None = None,
     res: int = 1024, samples: int = 24, max_dist_frac: float = 0.3,
+    source_mesh_path: str | None = None,
 ) -> None:
-    """Bake AO and pack ORM into the GLB. Raises on failure — callers decide
-    whether that's fatal (the worker treats it as non-fatal)."""
+    """Bake AO (and, when a higher-poly source is given, a tangent-space
+    normal map) and pack everything into the GLB. Raises on failure —
+    callers decide whether that's fatal (the worker treats it as non-fatal)."""
     t0 = time.time()
     mesh = pick_mesh(glb_in)
     log(f"mesh: {len(mesh.faces)} faces, {len(mesh.vertices)} verts")
+
+    pos, nrm, valid, fid = rasterize_uv(mesh, res)
+    n_texels = int(valid.sum())
+    log(f"rasterized UV: {n_texels} texels covered")
+
+    normal_img = None
+    if source_mesh_path:
+        try:
+            high = load_any_mesh(source_mesh_path)
+            if len(high.faces) > len(mesh.faces) * 1.02:
+                normal_img = bake_normal_map(mesh, high, pos, nrm, valid, fid)
+                log(f"normal map baked from {len(high.faces)}-face source")
+            else:
+                log(f"source has no extra detail ({len(high.faces)} vs {len(mesh.faces)} faces) — skipping normal bake")
+        except Exception as e:
+            log(f"normal bake skipped: {e}")
+
     ao = bake_ao(mesh, res, samples, max_dist_frac)
-    attach_orm_to_glb(glb_in, glb_out, ao, metallic_path, roughness_path)
+    attach_orm_to_glb(glb_in, glb_out, ao, metallic_path, roughness_path, normal_img)
     log(f"finalize done in {time.time()-t0:.1f}s -> {glb_out}")
 
 
@@ -258,12 +409,15 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--metallic", default=None)
     ap.add_argument("--roughness", default=None)
+    ap.add_argument("--source-mesh", default=None,
+                    help="higher-poly source GLB to bake a normal map from")
     ap.add_argument("--res", type=int, default=1024)
     ap.add_argument("--samples", type=int, default=24)
     ap.add_argument("--max-dist-frac", type=float, default=0.3)
     args = ap.parse_args()
     finalize(args.glb, args.out, args.metallic, args.roughness,
-             args.res, args.samples, args.max_dist_frac)
+             args.res, args.samples, args.max_dist_frac,
+             source_mesh_path=args.source_mesh)
     return 0
 
 

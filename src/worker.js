@@ -1273,6 +1273,29 @@ else:
       const meshPath = await this.downloadFromR2(job.sourceModelUrl, tmpDir, 'source_mesh');
       console.log(`[TextureWorker] Downloaded mesh → ${meshPath}`);
 
+      // When texturing a refined derivative, also fetch the lineage's v1
+      // original as bake_source.glb — the runner bakes a tangent-space
+      // normal map from it so the painted low-poly keeps the original's
+      // surface detail. Non-fatal if anything here fails.
+      try {
+        const { rows: srcJob } = await this.pool.query(
+          `SELECT model, "rootJobId" FROM genshape3d_jobs WHERE id=$1`, [job.sourceJobId],
+        );
+        if (srcJob[0]?.model === 'refine' && srcJob[0].rootJobId) {
+          const { rows: orig } = await this.pool.query(
+            `SELECT "resultUrl" FROM genshape3d_jobs
+             WHERE "rootJobId"=$1 AND version=1 AND "resultUrl" <> '' LIMIT 1`,
+            [srcJob[0].rootJobId],
+          );
+          if (orig[0]?.resultUrl) {
+            await this.downloadFromR2(orig[0].resultUrl, tmpDir, 'bake_source');
+            console.log(`[TextureWorker] Downloaded lineage v1 as normal-bake source.`);
+          }
+        }
+      } catch (e) {
+        console.warn(`[TextureWorker] bake-source fetch skipped: ${e.message}`);
+      }
+
       // ── Download reference image ───────────────────────────────────────
       let imagePath = null;
       if (job.sourceImageUrl) {
