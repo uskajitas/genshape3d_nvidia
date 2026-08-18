@@ -70,6 +70,47 @@ def remove_floaters(mesh: trimesh.Trimesh, keep_frac: float) -> tuple[trimesh.Tr
     return trimesh.util.concatenate(keep) if len(keep) > 1 else keep[0], removed
 
 
+def rebuild_surface(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh:
+    """TRUE retopology: throw the original topology away and reconstruct the
+    surface from scratch. Samples the mesh as an oriented point cloud, runs
+    Poisson reconstruction (guaranteed watertight, uniform tessellation),
+    trims low-support blobs, and decimates to the target. Use when the
+    topology itself is broken beyond repair — self-intersections, non-manifold
+    tangles, shredded regions where selection can't walk."""
+    import open3d as o3d
+
+    n_points = max(120_000, min(400_000, len(mesh.faces) * 6))
+    o3 = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(np.asarray(mesh.vertices)),
+        o3d.utility.Vector3iVector(np.asarray(mesh.faces)),
+    )
+    o3.compute_vertex_normals()
+    pcd = o3.sample_points_uniformly(number_of_points=n_points, use_triangle_normal=True)
+
+    rec, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+    # Poisson closes the field with big low-support membranes — cut the
+    # weakest 2% of vertices to remove them.
+    d = np.asarray(densities)
+    rec.remove_vertices_by_mask(d < np.quantile(d, 0.02))
+    rec.remove_degenerate_triangles()
+    rec.remove_unreferenced_vertices()
+
+    # Clamp to the original bounds (+2%) in case any membrane survived.
+    bb = mesh.bounds
+    pad = (bb[1] - bb[0]) * 0.02
+    box = o3d.geometry.AxisAlignedBoundingBox(bb[0] - pad, bb[1] + pad)
+    rec = rec.crop(box)
+
+    if target_faces > 0 and len(rec.triangles) > target_faces:
+        rec = rec.simplify_quadric_decimation(target_number_of_triangles=int(target_faces))
+        rec.remove_degenerate_triangles()
+        rec.remove_unreferenced_vertices()
+
+    return trimesh.Trimesh(
+        vertices=np.asarray(rec.vertices), faces=np.asarray(rec.triangles), process=False,
+    )
+
+
 def decimate(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh:
     import open3d as o3d
     o3 = o3d.geometry.TriangleMesh(
@@ -105,6 +146,8 @@ def main() -> int:
                     help="components smaller than this fraction of the biggest are floaters")
     ap.add_argument("--smooth", type=int, default=0, help="Taubin smoothing iterations")
     ap.add_argument("--no-fill-holes", action="store_true")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="TRUE retopology: Poisson surface reconstruction from scratch")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -115,6 +158,42 @@ def main() -> int:
     stats["faces_in"] = int(len(mesh.faces))
     stats["vertices_in"] = int(len(mesh.vertices))
     log(f"input: {stats['faces_in']} faces, {stats['vertices_in']} verts")
+
+    if args.rebuild:
+        # Rebuild path: floaters out first (they'd pollute the point cloud),
+        # then reconstruct the surface from scratch.
+        progress(20, "retopo", "Removing floating fragments...")
+        mesh, floaters = remove_floaters(mesh, args.keep_frac)
+        stats["floaters_removed"] = int(floaters)
+        stats["degenerate_removed"] = 0
+        progress(35, "retopo", "Rebuilding surface (Poisson)...")
+        mesh = rebuild_surface(mesh, args.target_faces or 40000)
+        # Trimming Poisson's low-support membranes can reopen the surface —
+        # close what's closable and orient consistently.
+        progress(75, "retopo", "Closing and orienting...")
+        try:
+            mesh.merge_vertices()
+            trimesh.repair.fill_holes(mesh)
+            trimesh.repair.fix_normals(mesh)
+        except Exception as e:
+            log(f"post-rebuild cleanup partial: {e}")
+        if args.smooth > 0:
+            progress(85, "retopo", "Smoothing...")
+            mesh = taubin_smooth(mesh, args.smooth)
+            mesh.merge_vertices()
+        stats["rebuilt"] = True
+        stats["faces_out"] = int(len(mesh.faces))
+        stats["vertices_out"] = int(len(mesh.vertices))
+        stats["watertight"] = bool(mesh.is_watertight)
+        progress(92, "exporting", "Exporting GLB...")
+        mesh.visual = trimesh.visual.ColorVisuals(mesh)
+        mesh.export(args.output)
+        stats["time"] = round(time.time() - t0, 1)
+        log(f"rebuilt: {stats['faces_in']}->{stats['faces_out']} faces, "
+            f"watertight={stats['watertight']}, {stats['time']}s")
+        progress(100, "done", "Rebuild complete")
+        emit_result(output_path=args.output, **stats)
+        return 0
 
     progress(15, "repair", "Welding vertices...")
     mesh.merge_vertices()

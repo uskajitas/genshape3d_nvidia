@@ -1453,6 +1453,7 @@ else:
         '--smooth', String(ops.smooth || 0),
       ];
       if (ops.fillHoles === false) args.push('--no-fill-holes');
+      if (ops.rebuild === true) args.push('--rebuild');
 
       console.log(`[RefineWorker] Spawning: ${pythonCmd} ${args.slice(1).join(' ')}`);
       let stats = {};
