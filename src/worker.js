@@ -711,6 +711,26 @@ class Worker extends EventEmitter {
       job.completedAt = completedAt;
       this.completedJobs.unshift(job);
       this.emit('jobComplete', job);
+
+      // Smart Mesh: generation jobs flagged autoRefine chain straight into
+      // the refine pipeline (rebuild + decimate + unwrap + normal/AO bake)
+      // so the user gets a game-ready retopologized version automatically.
+      if (job.autoRefine) {
+        try {
+          const target = Math.min(Math.max(parseInt(job.targetFaceCount) || 30000, 2000), 200000);
+          await this.pool.query(
+            `INSERT INTO genshape3d_refine_jobs
+               (id, "userEmail", "sourceJobId", "sourceModelUrl", operations)
+             VALUES ($5, $1, $2, $3, $4)`,
+            [job.userEmail, job.id, outputUrl, JSON.stringify({
+              targetFaces: target, fillHoles: true, smooth: 2, keepFrac: 0.02, rebuild: true,
+            }), crypto.randomUUID()]
+          );
+          console.log(`[Worker] autoRefine: queued Smart Mesh refine for ${job.id.slice(0, 8)} (target ${target})`);
+        } catch (e) {
+          console.error(`[Worker] autoRefine enqueue failed for ${job.id}:`, e.message);
+        }
+      }
     } catch (err) {
       console.error(`[Worker] Job ${job.id} failed:`, err && err.stack || err.message);
       const completedAt = new Date().toISOString();
