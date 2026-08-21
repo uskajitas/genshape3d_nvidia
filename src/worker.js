@@ -223,6 +223,7 @@ class Worker extends EventEmitter {
         ['"guidanceScale"',    'REAL NOT NULL DEFAULT 0'],
         ['"numChunks"',        'INTEGER NOT NULL DEFAULT 0'],
         ['"seed"',             'INTEGER NOT NULL DEFAULT 0'],
+        ['"previewUrl"',       "TEXT NOT NULL DEFAULT ''"],
       ];
       for (const [col, type] of newCols) {
         try {
@@ -700,11 +701,20 @@ class Worker extends EventEmitter {
       const outputUrl = await this.uploadToR2(glbPath);
       console.log(`[Worker] Uploaded GLB to ${outputUrl}`);
 
+      // Streaming preview: JPEG textures + meshopt geometry (~8x smaller).
+      // Best-effort — a failed preview never fails the job.
+      let previewUrl = '';
+      try {
+        previewUrl = await this.makePreview(glbPath);
+      } catch (e) {
+        console.error(`[Worker] preview build failed (serving full GLB): ${e.message}`);
+      }
+
       // Update job as complete
       const completedAt = new Date().toISOString();
       await this.pool.query(
-        `UPDATE genshape3d_jobs SET status = 'done', "resultUrl" = $1, "completedAt" = $2, "progressPct" = 100, "progressPhase" = 'Generation complete!', "updatedAt" = NOW() WHERE id = $3`,
-        [outputUrl, completedAt, job.id]
+        `UPDATE genshape3d_jobs SET status = 'done', "resultUrl" = $1, "previewUrl" = $4, "completedAt" = $2, "progressPct" = 100, "progressPhase" = 'Generation complete!', "updatedAt" = NOW() WHERE id = $3`,
+        [outputUrl, completedAt, job.id, previewUrl]
       );
       job.status = 'done';
       job.resultUrl = outputUrl;
@@ -1090,6 +1100,31 @@ else:
    * Returns { touch, stop, killedWhy } — call touch() on every output chunk,
    * stop() once the process closes; killedWhy() is set if we pulled the plug.
    */
+  /**
+   * Build the streaming preview GLB next to `glbPath` and upload it.
+   * Textures -> JPEG (normal maps untouched) via make_preview.py in the
+   * hunyuan venv, then meshopt (-cc) via gltfpack. Returns the R2 url.
+   */
+  async makePreview(glbPath) {
+    const path_ = require('path');
+    const dir = path_.dirname(glbPath);
+    const texPath = path_.join(dir, 'preview_tex.glb');
+    const outPath = path_.join(dir, 'preview.glb');
+    const venvPy = 'C:/projects/genshape-worker-3090/runners/hunyuan3d-2-1/.venv/Scripts/python.exe';
+    const script = 'C:/projects/genshape-worker-3090/runners/hunyuan3d-2-1/make_preview.py';
+    const run = (cmd, args) => new Promise((resolve, reject) => {
+      const p = spawn(cmd, args, { shell: process.platform === 'win32' });
+      let err = '';
+      p.stderr.on('data', d => { err += d; });
+      p.on('close', c => c === 0 ? resolve() : reject(new Error(`${cmd} exited ${c}: ${err.slice(0, 300)}`)));
+    });
+    await run(venvPy, [script, glbPath, texPath]);
+    await run('npx', ['--prefix', __dirname + '/..', 'gltfpack', '-i', texPath, '-o', outPath, '-cc']);
+    const url = await this.uploadToR2(outPath);
+    console.log(`[Worker] preview uploaded (${(require('fs').statSync(outPath).size / 1e6).toFixed(1)}MB): ${url}`);
+    return url;
+  }
+
   attachWatchdog(proc, label) {
     const STALL_MS = parseInt(process.env.RUNNER_STALL_TIMEOUT_MS || String(15 * 60 * 1000), 10);
     const HARD_MS  = parseInt(process.env.RUNNER_JOB_TIMEOUT_MS   || String(60 * 60 * 1000), 10);
