@@ -482,7 +482,11 @@ class Worker extends EventEmitter {
             return ((m === 'hunyuan3d' || m === 'hunyuan3d-2-1') && j.doTexture) || m === 'hi3dgen' || m === 'trellis2';
           };
           const heavyRunning = this.processingJobs.some(isHeavy);
-          const blocked = heavyRunning || (isHeavy(nextJob) && this.processingJobs.length > 0);
+          // refineActive: a running refine (Poisson rebuild + bake eats RAM
+          // and some GPU) must also block heavy jobs — a trellis2 load next
+          // to a rebuild starved and died with a misleading HF-404 error.
+          const blocked = heavyRunning
+            || (isHeavy(nextJob) && (this.processingJobs.length > 0 || this.refineActive));
           if (blocked) {
             console.log(`[Worker] holding ${nextJob.id.slice(0,8)} — GPU exclusivity (heavy job running or queued job is heavy).`);
           } else {
@@ -1487,6 +1491,15 @@ else:
    * normal derivative asset. The source job is never touched.
    */
   async processRefineJob(job) {
+    this.refineActive = true;
+    try {
+      await this._processRefineJobInner(job);
+    } finally {
+      this.refineActive = false;
+    }
+  }
+
+  async _processRefineJobInner(job) {
     this.activeCount++;
     let tmpDir;
     try {

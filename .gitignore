@@ -5,3 +5,4 @@ worker.log.*
 dist/
 # one-off DB diagnostic scripts (throwaway)
 _*.js
+preview_backfill.tmp.js
