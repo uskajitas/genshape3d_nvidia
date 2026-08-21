@@ -534,6 +534,26 @@ class Worker extends EventEmitter {
           console.warn(`[Worker] Refine job poll failed (non-fatal): ${refErr.message}`);
         }
       }
+
+      // ── Segment jobs (PartField part segmentation) ────────────────────────
+      // GPU inference but light (~4 GB VRAM, 1-3 min) — same only-when-idle
+      // gate as refine keeps the exclusivity logic trivial.
+      if (this.activeCount === 0 && fs.existsSync('C:/projects/genshape-worker-3090/runners/partfield/run.py')) {
+        try {
+          const { rows: segPending } = await this.pool.query(
+            `SELECT * FROM genshape3d_segment_jobs
+             WHERE status = 'pending' AND deleted = false
+             ORDER BY "createdAt" ASC
+             LIMIT 1`,
+          );
+          if (segPending.length > 0) {
+            console.log(`[Worker] Picking up segment job ${segPending[0].id.slice(0, 8)}`);
+            this.processSegmentJob(segPending[0]);
+          }
+        } catch (segErr) {
+          console.warn(`[Worker] Segment job poll failed (non-fatal): ${segErr.message}`);
+        }
+      }
     } catch (err) {
       console.error('[Worker] Poll error:', err.message);
       console.error(err.stack);
@@ -1666,15 +1686,156 @@ else:
     }
   }
 
-  async uploadToR2(filePath) {
+  /**
+   * Process a part-segmentation job from genshape3d_segment_jobs.
+   * Downloads the source GLB, runs the PartField runner (learned per-face
+   * feature field + hierarchical clustering), uploads the canonical
+   * segmented GLB + labels JSON, and marks the job done. The client must
+   * render the uploaded meshUrl — its face order is the label space.
+   */
+  async processSegmentJob(job) {
+    this.activeCount++;
+    let tmpDir;
+    try {
+      const claim = await this.pool.query(
+        `UPDATE genshape3d_segment_jobs
+            SET status='processing', "startedAt"=NOW(), "assignedWorkerId"=$1,
+                "updatedAt"=NOW(), "progressPct"=0, "progressPhase"='Preparing...'
+          WHERE id=$2 AND status='pending'`,
+        [this.workerId, job.id],
+      );
+      if (claim.rowCount === 0) {
+        console.log(`[SegmentWorker] Job ${job.id.slice(0, 8)} already claimed, skipping.`);
+        this.activeCount--;
+        return;
+      }
+
+      const updateProgress = async (pct, phase) => {
+        try {
+          await this.pool.query(
+            `UPDATE genshape3d_segment_jobs
+                SET "progressPct"=$1, "progressPhase"=$2, "updatedAt"=NOW() WHERE id=$3`,
+            [pct, phase, job.id],
+          );
+        } catch { /* non-fatal */ }
+      };
+
+      tmpDir = path.join(os.tmpdir(), `genshape3d-seg-${job.id}`);
+      fs.mkdirSync(tmpDir, { recursive: true });
+
+      await updateProgress(2, 'Downloading mesh...');
+      const meshPath = await this.downloadFromR2(job.sourceModelUrl, tmpDir, 'source_mesh');
+
+      const runnersDir = process.env.RUNNERS_DIR || 'C:/projects/genshape-worker-3090/runners';
+      const runnerDir = path.join(runnersDir, 'partfield');
+      const pythonCmd = path.join(runnerDir, '.venv', 'Scripts', 'python.exe');
+      const outDir = path.join(tmpDir, 'out');
+
+      const args = [
+        path.join(runnerDir, 'run.py'),
+        '--mesh', meshPath,
+        '--output-dir', outDir,
+      ];
+
+      console.log(`[SegmentWorker] Spawning: ${pythonCmd} ${args.slice(1).join(' ')}`);
+      const stopGpu = this.startGpuSampler();
+      let result = {};
+      try {
+        await new Promise((resolve, reject) => {
+          const proc = spawn(pythonCmd, args, {
+            cwd: runnerDir,
+            env: { ...process.env },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          const watchdog = this.attachWatchdog(proc, 'PartField');
+          let stdout = '', stderr = '';
+          proc.stdout.on('data', data => {
+            watchdog.touch();
+            const text = data.toString();
+            stdout += text;
+            text.split('\n').filter(Boolean).forEach(line => {
+              if (line.startsWith('PROGRESS:')) {
+                try {
+                  const p = JSON.parse(line.slice(9));
+                  updateProgress(p.pct || 0, p.detail || p.phase || '').catch(() => {});
+                } catch { /* ignore */ }
+              } else if (!line.startsWith('RESULT:')) {
+                console.log(`[PartField] ${line}`);
+              }
+            });
+          });
+          proc.stderr.on('data', data => {
+            watchdog.touch();
+            stderr += data.toString();
+          });
+          proc.on('close', code => {
+            watchdog.stop();
+            if (watchdog.killedWhy()) return reject(new Error(`PartField killed by watchdog: ${watchdog.killedWhy()}`));
+            const resultLine = stdout.split('\n').find(l => l.startsWith('RESULT:'));
+            if (resultLine) {
+              try { result = JSON.parse(resultLine.slice(7)); } catch { /* keep {} */ }
+            }
+            if (result.status === 'error') return reject(new Error(`PartField: ${result.error}`));
+            if (code !== 0) return reject(new Error(`PartField exited ${code}: ${stderr.slice(-400)}`));
+            if (!result.output_glb || !fs.existsSync(result.output_glb)) {
+              return reject(new Error('PartField produced no segmented GLB'));
+            }
+            if (!result.output_labels || !fs.existsSync(result.output_labels)) {
+              return reject(new Error('PartField produced no labels JSON'));
+            }
+            resolve();
+          });
+          proc.on('error', err => reject(new Error(`Failed to spawn PartField: ${err.message}`)));
+        });
+      } finally {
+        await stopGpu();
+      }
+
+      await updateProgress(96, 'Uploading segmentation...');
+      const meshUrl = await this.uploadToR2(result.output_glb);
+      const labelsUrl = await this.uploadToR2(result.output_labels, {
+        ext: '.json', contentType: 'application/json',
+      });
+
+      await this.pool.query(
+        `UPDATE genshape3d_segment_jobs
+            SET status='done', "meshUrl"=$1, "labelsUrl"=$2, "faceCount"=$3,
+                "completedAt"=NOW(), "progressPct"=100,
+                "progressPhase"='Segmentation complete!', "updatedAt"=NOW()
+          WHERE id=$4`,
+        [meshUrl, labelsUrl, result.face_count || 0, job.id],
+      );
+      console.log(`[SegmentWorker] Job ${job.id.slice(0, 8)} complete ✓ (${result.face_count} faces, ${result.levels} levels)`);
+
+    } catch (err) {
+      console.error(`[SegmentWorker] Job ${job.id} failed:`, err.stack || err.message);
+      try {
+        await this.pool.query(
+          `UPDATE genshape3d_segment_jobs
+              SET status='failed', "completedAt"=NOW(), "progressPhase"='failed',
+                  "errorMessage"=$1, "updatedAt"=NOW()
+            WHERE id=$2`,
+          [(err.message || '').slice(0, 4000), job.id],
+        );
+      } catch { /* non-fatal */ }
+    } finally {
+      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+      this.activeCount--;
+      this.processing = this.activeCount > 0;
+      this.emit('stateChanged');
+    }
+  }
+
+  async uploadToR2(filePath, opts = {}) {
     const buffer = fs.readFileSync(filePath);
-    const key = `outputs/${Date.now()}-${crypto.randomUUID()}.glb`;
+    const ext = opts.ext || '.glb';
+    const key = `outputs/${Date.now()}-${crypto.randomUUID()}${ext}`;
 
     await this.s3.send(new PutObjectCommand({
       Bucket: this.config.r2Bucket,
       Key: key,
       Body: buffer,
-      ContentType: 'model/gltf-binary',
+      ContentType: opts.contentType || 'model/gltf-binary',
     }));
 
     const publicUrl = this.config.r2PublicUrl || `${this.config.r2Endpoint}/${this.config.r2Bucket}`;
