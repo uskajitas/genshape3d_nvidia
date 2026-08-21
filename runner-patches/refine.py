@@ -61,13 +61,29 @@ def load_biggest_mesh(path: str) -> trimesh.Trimesh:
 
 
 def remove_floaters(mesh: trimesh.Trimesh, keep_frac: float) -> tuple[trimesh.Trimesh, int]:
-    comps = mesh.split(only_watertight=False)
+    # Label components on the face-adjacency graph and drop small ones with a
+    # single boolean mask. Never split() into submeshes: trellis meshes can
+    # carry THOUSANDS of tiny fragments, and split()+concatenate() on one of
+    # those exhausted all system RAM and froze the whole machine.
+    comps = trimesh.graph.connected_components(
+        mesh.face_adjacency, nodes=np.arange(len(mesh.faces)),
+    )
     if len(comps) <= 1:
         return mesh, 0
-    biggest = max(len(c.faces) for c in comps)
-    keep = [c for c in comps if len(c.faces) >= max(1, int(biggest * keep_frac))]
-    removed = len(comps) - len(keep)
-    return trimesh.util.concatenate(keep) if len(keep) > 1 else keep[0], removed
+    biggest = max(len(c) for c in comps)
+    min_faces = max(1, int(biggest * keep_frac))
+    keep_mask = np.zeros(len(mesh.faces), dtype=bool)
+    removed = 0
+    for c in comps:
+        if len(c) >= min_faces:
+            keep_mask[c] = True
+        else:
+            removed += 1
+    if removed == 0:
+        return mesh, 0
+    mesh.update_faces(keep_mask)
+    mesh.remove_unreferenced_vertices()
+    return mesh, removed
 
 
 def rebuild_surface(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh:
