@@ -86,6 +86,74 @@ def remove_floaters(mesh: trimesh.Trimesh, keep_frac: float) -> tuple[trimesh.Tr
     return mesh, removed
 
 
+def remesh_part(mesh: trimesh.Trimesh, part_faces: np.ndarray, smooth: int,
+                stats: dict) -> trimesh.Trimesh:
+    """Re-topologize ONLY the given faces; the rest of the mesh is untouched.
+
+    The patch is decimated with its boundary locked (preserveboundary), so the
+    boundary loop's vertices keep their exact coordinates and the patch welds
+    back onto the untouched remainder seamlessly. Face indices refer to the
+    input mesh AS LOADED — callers must pass the canonical segmented GLB.
+    """
+    import pymeshlab
+
+    # Weld duplicate vertices FIRST or the patch/rest border (and seams inside
+    # the patch) read as open boundary everywhere — decimation then fragments
+    # and the re-weld cracks. merge_vertices only rewrites indices: face count
+    # and order are unchanged, so the caller's face indices stay valid.
+    mesh.merge_vertices()
+
+    sel = np.zeros(len(mesh.faces), dtype=bool)
+    sel[part_faces] = True
+    n_in = int(sel.sum())
+    if n_in < 16:
+        raise RuntimeError(f"selected part too small to remesh ({n_in} faces)")
+
+    ms = pymeshlab.MeshSet()
+    ms.add_mesh(pymeshlab.Mesh(vertex_matrix=mesh.vertices,
+                               face_matrix=mesh.faces[sel]), "patch")
+    target = max(200, int(n_in * 0.4))
+    ms.apply_filter(
+        "meshing_decimation_quadric_edge_collapse",
+        targetfacenum=target,
+        preserveboundary=True,
+        boundaryweight=1000.0,
+        preservenormal=True,
+        planarquadric=True,
+        qualitythr=0.3,
+    )
+    if smooth > 0:
+        # pymeshlab's boundary flag does NOT reliably pin the loop — smooth,
+        # then snap the boundary vertices back to their exact pre-smooth
+        # coordinates (smoothing keeps topology, so indices are stable).
+        # The weld with the untouched remainder must be bit-exact.
+        pre = ms.current_mesh()
+        pre_v = pre.vertex_matrix().copy()
+        pre_f = pre.face_matrix()
+        edges = np.sort(pre_f[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+        from trimesh.grouping import group_rows
+        bidx = np.unique(edges[group_rows(edges, require_count=1)])
+        ms.apply_filter("apply_coord_laplacian_smoothing",
+                        stepsmoothnum=int(smooth), boundary=False)
+        sm = ms.current_mesh()
+        sv = sm.vertex_matrix().copy()
+        sv[bidx] = pre_v[bidx]
+        patch = trimesh.Trimesh(vertices=sv, faces=sm.face_matrix(), process=False)
+    else:
+        pm = ms.current_mesh()
+        patch = trimesh.Trimesh(vertices=pm.vertex_matrix(),
+                                faces=pm.face_matrix(), process=False)
+
+    rest = trimesh.Trimesh(vertices=mesh.vertices,
+                           faces=mesh.faces[~sel], process=False)
+    out = trimesh.util.concatenate([rest, patch])
+    out.merge_vertices()
+    out.remove_unreferenced_vertices()
+    stats["part_faces_in"] = n_in
+    stats["part_faces_out"] = int(len(patch.faces))
+    return out
+
+
 def rebuild_surface(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh:
     """TRUE retopology: throw the original topology away and reconstruct the
     surface from scratch. Samples the mesh as an oriented point cloud, runs
@@ -215,6 +283,9 @@ def main() -> int:
                     help="TRUE retopology: Poisson surface reconstruction from scratch")
     ap.add_argument("--no-bake", action="store_true",
                     help="skip UV unwrap + normal/AO bake on the refined mesh")
+    ap.add_argument("--part-faces", default="",
+                    help="JSON file {rle:[label,run,...], part:N}: remesh only that "
+                         "part's faces (input must be the canonical segmented GLB)")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -225,6 +296,36 @@ def main() -> int:
     stats["faces_in"] = int(len(mesh.faces))
     stats["vertices_in"] = int(len(mesh.vertices))
     log(f"input: {stats['faces_in']} faces, {stats['vertices_in']} verts")
+
+    if args.part_faces:
+        # Part-scoped cleanup: never touch the rest of the mesh, skip
+        # repair/bake entirely (the canonical seg GLB is untextured clay).
+        with open(args.part_faces) as f:
+            spec = json.load(f)
+        rle, part = spec["rle"], int(spec.get("part", 0))
+        labels = np.zeros(stats["faces_in"], dtype=np.int32)
+        fi = 0
+        for i in range(0, len(rle), 2):
+            lab, run = int(rle[i]), int(rle[i + 1])
+            labels[fi:fi + run] = lab
+            fi += run
+        if fi != stats["faces_in"]:
+            raise RuntimeError(f"part rle covers {fi} of {stats['faces_in']} faces — "
+                               "was the selection made on a different mesh?")
+        part_faces = np.nonzero(labels == part)[0]
+        progress(40, "retopo", f"Remeshing part ({len(part_faces)} faces)...")
+        mesh = remesh_part(mesh, part_faces, args.smooth, stats)
+        stats["faces_out"] = int(len(mesh.faces))
+        stats["vertices_out"] = int(len(mesh.vertices))
+        progress(92, "exporting", "Exporting GLB...")
+        mesh.visual = trimesh.visual.ColorVisuals(mesh)
+        mesh.export(args.output)
+        stats["time"] = round(time.time() - t0, 1)
+        log(f"part remeshed: {stats['part_faces_in']}->{stats['part_faces_out']} faces "
+            f"(mesh {stats['faces_in']}->{stats['faces_out']}), {stats['time']}s")
+        progress(100, "done", "Part cleanup complete")
+        emit_result(output_path=args.output, **stats)
+        return 0
 
     if args.rebuild:
         # Rebuild path: floaters out first (they'd pollute the point cloud),

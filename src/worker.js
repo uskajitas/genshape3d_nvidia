@@ -1568,6 +1568,13 @@ else:
       ];
       if (ops.fillHoles === false) args.push('--no-fill-holes');
       if (ops.rebuild === true) args.push('--rebuild');
+      if (Array.isArray(ops.partRle) && ops.partRle.length) {
+        // Part-scoped cleanup: remesh only the selected part's faces. The
+        // source mesh MUST be the canonical segmented GLB the rle refers to.
+        const pf = path.join(tmpDir, 'part_sel.json');
+        fs.writeFileSync(pf, JSON.stringify({ rle: ops.partRle, part: ops.partIndex || 0 }));
+        args.push('--part-faces', pf);
+      }
 
       console.log(`[RefineWorker] Spawning: ${pythonCmd} ${args.slice(1).join(' ')}`);
       let stats = {};
@@ -1631,7 +1638,9 @@ else:
       const nextVersion = verRows[0]?.next || 2;
       const ops2 = typeof job.operations === 'string' ? JSON.parse(job.operations) : (job.operations || {});
       const faceNote = stats.faces_out ? ` ${Math.round(stats.faces_out / 1000)}k` : '';
-      const versionLabel = `${ops2.rebuild ? 'rebuilt' : 'refined'}${faceNote}`;
+      const versionLabel = Array.isArray(ops2.partRle) && ops2.partRle.length
+        ? 'part cleanup'
+        : `${ops2.rebuild ? 'rebuilt' : 'refined'}${faceNote}`;
       const newJobId = crypto.randomUUID();
       const nowIso = new Date().toISOString();
       await this.pool.query(
