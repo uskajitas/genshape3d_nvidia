@@ -151,6 +151,36 @@ def main() -> int:
     )
     print(f"[trellis2] GLB baked in {time.time() - t2:.1f}s", flush=True)
 
+    # Drop floater specks at the source. Marching-cubes reconstruction sheds
+    # thousands of tiny disconnected fragments (a switch shipped 3,752; another
+    # model 8,117) that read as "background noise" on every model downstream.
+    # Conservative cutoff — only components far too small to be a real part
+    # survive the cull threshold. Mask-based labelling, never split(): the
+    # submesh route exhausted RAM on exactly these fragment counts before.
+    try:
+        import numpy as _np
+        import trimesh as _tm
+        if hasattr(glb, "faces") and len(glb.faces) > 0:
+            _comps = _tm.graph.connected_components(
+                glb.face_adjacency, nodes=_np.arange(len(glb.faces)))
+            if len(_comps) > 1:
+                _biggest = max(len(c) for c in _comps)
+                _min_faces = max(16, int(_biggest * 0.001))
+                _keep = _np.zeros(len(glb.faces), dtype=bool)
+                _dropped = 0
+                for _c in _comps:
+                    if len(_c) >= _min_faces:
+                        _keep[_c] = True
+                    else:
+                        _dropped += 1
+                if _dropped:
+                    glb.update_faces(_keep)
+                    glb.remove_unreferenced_vertices()
+                    print(f"[trellis2] dropped {_dropped} floater fragment(s) "
+                          f"(<{_min_faces} faces each)", flush=True)
+    except Exception as _e:  # cull is best-effort; never fail the job over it
+        print(f"[trellis2] floater cull skipped: {_e}", flush=True)
+
     out_path = args.output
     if not out_path.lower().endswith(".glb"):
         out_path = os.path.splitext(out_path)[0] + ".glb"
