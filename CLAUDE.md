@@ -12,9 +12,10 @@ committing, the auto-deploy watcher ran `git reset --hard origin/main`,
 and all five hours were destroyed. It then happened a SECOND time, sixty
 seconds after a commit — because the commit was never pushed.
 
-**A commit that is not pushed does not exist.** The watcher syncs this
-machine to `origin`. Anything only on disk, and anything only committed
-locally, is on a timer measured in seconds.
+**A commit that is not pushed does not exist.** The auto-deploy watcher
+that caused this is RETIRED (2026-09-04) — it no longer resets anything,
+but that doesn't make unpushed work safe. Anything only on disk, and
+anything only committed locally, is not backed up anywhere else.
 
 Every single time something works:
 
