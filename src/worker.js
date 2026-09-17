@@ -635,6 +635,27 @@ class Worker extends EventEmitter {
         console.log(`[Worker] Using ${auxImagePaths.length} auxiliary view(s) for multi-view conditioning.`);
       }
 
+      // ── A 'multiview' job: the sides ARE the result ───────────────
+      // The Bench asks for the other sides of a picture as a job of its
+      // own — Zero123++ on this GPU, no Replicate. The views go to R2 the
+      // same way the auto-mv step's do; the row is marked done with the
+      // back view as its result so the ordinary "done + resultUrl" test
+      // holds, and the server reads the labelled keys from auxImageUrls.
+      if ((job.model || '').toLowerCase() === 'multiview') {
+        const generated = await this.generateLocalMultiView(inputImagePath, tmpDir, job.id, 'side,back,left');
+        if (!generated.r2Urls || generated.r2Urls.length === 0) throw new Error('Zero123++ produced no views');
+        const completedAt = new Date().toISOString();
+        await this.pool.query(
+          `UPDATE genshape3d_jobs SET status = 'done', "resultUrl" = $1, "auxImageUrls" = $2::jsonb, "completedAt" = $3, "progressPct" = 100, "progressPhase" = 'Sides drawn', "updatedAt" = NOW() WHERE id = $4`,
+          [generated.r2Urls[0], JSON.stringify(generated.r2Urls), completedAt, job.id]
+        );
+        job.status = 'done'; job.resultUrl = generated.r2Urls[0]; job.auxImageUrls = generated.r2Urls; job.completedAt = completedAt;
+        this.completedJobs.unshift(job);
+        this.emit('jobComplete', job);
+        console.log(`[Worker] multiview job ${job.id.slice(0, 8)}: ${generated.r2Urls.length} view(s) drawn`);
+        return;
+      }
+
       // ── Local multi-view auto-generation ─────────────────────────
       // If no aux views came in with the job, generate them right here
       // on this machine using Zero123++ (no Replicate, no API).
@@ -1001,7 +1022,7 @@ else:
    * Returns { localPaths: string[], r2Urls: string[] } — empty arrays
    * on any failure (caller falls back to single-view).
    */
-  async generateLocalMultiView(inputImagePath, tmpDir, jobId) {
+  async generateLocalMultiView(inputImagePath, tmpDir, jobId, labels = 'back,left') {
     const pythonCmd = process.env.PYTHON_CMD || 'python';
     const scriptPath = path.join(__dirname, 'multiview_zero123.py');
     const outDir = path.join(tmpDir, 'mv_views');
@@ -1013,7 +1034,7 @@ else:
     });
 
     const result = await new Promise((resolve, reject) => {
-      const proc = spawn(pythonCmd, [scriptPath, '--image', inputImagePath, '--output-dir', outDir], {
+      const proc = spawn(pythonCmd, [scriptPath, '--image', inputImagePath, '--output-dir', outDir, '--labels', labels], {
         cwd: path.dirname(scriptPath),
         env: { ...process.env },
         stdio: ['ignore', 'pipe', 'pipe'],
