@@ -1,0 +1,22 @@
+# Python 3.11, Windows, RTX 3090 (sm_86 -> Nunchaku INT4).
+#
+# torch first, from the CUDA 12.8 index:
+#   pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+# then:
+#   pip install -r requirements.txt
+#
+# The Nunchaku wheel is not on PyPI (the "nunchaku" name there is an unrelated
+# package); it comes from the project's GitHub release and must match
+# python 3.11 + torch 2.8 + cu12.8.
+
+diffusers==0.40.0
+transformers==5.17.0
+accelerate==1.15.0
+safetensors==0.8.0
+huggingface_hub==1.33.0
+sentencepiece==0.2.2
+protobuf==7.36.2
+pillow==12.3.0
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+https://github.com/nunchaku-tech/nunchaku/releases/download/v1.2.1/nunchaku-1.2.1%2Bcu12.8torch2.8-cp311-cp311-win_amd64.whl
