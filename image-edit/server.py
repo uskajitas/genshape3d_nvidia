@@ -23,6 +23,7 @@ import os
 import re
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from typing import Optional
@@ -291,8 +292,11 @@ class Editor:
         # VRAM is exhausted and the process access-violates. Accelerate still
         # offloads the text encoder and VAE as whole modules in fast mode.
         transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(
-            self.transformer_path, torch_dtype=torch.bfloat16, offload=True
+            self.transformer_path, torch_dtype=torch.bfloat16, offload=False
         )
+        # The wheel's default pins every CPU block. On this 32 GB host that
+        # exhausted CUDA's host allocation during preload, despite free VRAM.
+        transformer.set_offload(True, use_pin_memory=False)
         bridge_to_diffusers(transformer)
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(LIGHTNING_SCHEDULER)
         pipe = QwenImageEditPlusPipeline.from_pretrained(
@@ -403,7 +407,7 @@ def preload() -> None:
         # eventually instead of holding the weights for ever.
         editor.last_used = time.time()
     except Exception as e:  # noqa: BLE001
-        log(f"preload failed: {e!r}")
+        log(f"preload failed: {e!r}\n{traceback.format_exc()}")
 
 
 def generation_size(w: int, h: int) -> "tuple[int, int]":
@@ -484,7 +488,7 @@ def edit(req: EditRequest):
         log(f"edit {image.size[0]}x{image.size[1]} in {ms} ms ({editor.mode}): {prompt[:70]}")
         return {"image": encode_jpeg(out), "ms": ms, "model": MODEL_NAME}
     except Exception as e:  # every failure is an HTTP 500 with a readable reason
-        log(f"edit failed after {int((time.time() - t0) * 1000)} ms: {e!r}")
+        log(f"edit failed after {int((time.time() - t0) * 1000)} ms: {e!r}\n{traceback.format_exc()}")
         return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {e}"})
 
 
