@@ -69,11 +69,11 @@ a good neighbour:
 - **Dropped when idle.** A watcher thread unloads the pipeline after
   `IMAGE_EDIT_IDLE_UNLOAD_MIN` (60) idle minutes and empties the CUDA cache.
 - **One at a time.** A lock around the edit; concurrent calls queue.
-- **Two load modes.** With ≥ 18.5 GB free it loads *fast*
-  (`enable_model_cpu_offload`, one module on the GPU at a time). Below that it
-  loads *lean*: Nunchaku streams the transformer's blocks itself and the 7B text
-  encoder goes through `accelerate.cpu_offload` layer by layer. Slower, always
-  fits. An out-of-memory in fast mode falls back to lean by itself.
+- **Two load modes.** Nunchaku always streams the transformer's int4 blocks;
+  moving its whole native model onto the GPU leaks allocations across edits.
+  With ≥ 18.5 GB free, *fast* mode offloads the text encoder and VAE as whole
+  modules. Below that, *lean* mode streams the 7B text encoder layer by layer.
+  An out-of-memory in fast mode falls back to lean.
 - **It asks Ollama to let go** (`keep_alive: 0`) when VRAM is short. Ollama
   reloads on its next chat job. Set `IMAGE_EDIT_YIELD_OLLAMA=0` to stop that.
 

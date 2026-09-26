@@ -285,8 +285,13 @@ class Editor:
         # The path was resolved at startup, and the base repo is read with
         # local_files_only: a load can never turn into a download, neither at
         # startup nor on the request that follows an idle unload.
+        # The native int4 transformer must use Nunchaku's block offloader even
+        # in fast mode. Moving the whole native model with accelerate works for
+        # one edit, then the next call retains its prior CUDA allocations until
+        # VRAM is exhausted and the process access-violates. Accelerate still
+        # offloads the text encoder and VAE as whole modules in fast mode.
         transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(
-            self.transformer_path, torch_dtype=torch.bfloat16, offload=lean
+            self.transformer_path, torch_dtype=torch.bfloat16, offload=True
         )
         bridge_to_diffusers(transformer)
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(LIGHTNING_SCHEDULER)
