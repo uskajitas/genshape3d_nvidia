@@ -32,7 +32,10 @@ module.exports = {
         PYTHONUNBUFFERED: '1',
         IMAGE_EDIT_HOST: '127.0.0.1',
         IMAGE_EDIT_PORT: '8410',
-        IMAGE_EDIT_IDLE_UNLOAD_MIN: '10',
+        // The model is loaded at startup and kept for an hour of idleness: a cold
+        // load reads 29 GB off the disk and cannot be done inside a request.
+        IMAGE_EDIT_IDLE_UNLOAD_MIN: '60',
+        IMAGE_EDIT_PRELOAD: '1',
       },
     },
   ],

@@ -3,8 +3,11 @@
 One picture in, one picture out, same size, only what the prompt asks changed.
 Free replacement for the paid cloud editor ugen2d used for its 2D rigs.
 
-The GPU is shared with the 3D worker and the local LLMs, so the model is loaded
-on the first edit and dropped again after IDLE_UNLOAD_MIN idle minutes.
+The model is loaded while the server starts, in a background thread, so the port
+answers at once and the first /edit finds the pipeline already in memory. A
+request never downloads anything: the weights are resolved once at startup and
+every load after that is local_files_only. A download inside the first request is
+what made every fleet job die at the caller's 300 s timeout.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from __future__ import annotations
 import base64
 import binascii
 import gc
+import inspect
 import io
 import json
 import math
@@ -45,7 +49,12 @@ NUNCHAKU_FILE = os.environ.get(
 
 DEFAULT_STEPS = int(os.environ.get("IMAGE_EDIT_STEPS", "8"))
 JPEG_QUALITY = 92
-IDLE_UNLOAD_SEC = float(os.environ.get("IMAGE_EDIT_IDLE_UNLOAD_MIN", "10")) * 60
+# The cold load is minutes of reading 29 GB off the disk, so the pipeline is kept
+# across a long idle stretch instead of being rebuilt for every straggling job.
+# Keeping it costs almost no VRAM: fast mode parks the weights in host RAM and
+# walks one module at a time across the bus.
+IDLE_UNLOAD_SEC = float(os.environ.get("IMAGE_EDIT_IDLE_UNLOAD_MIN", "60")) * 60
+PRELOAD = os.environ.get("IMAGE_EDIT_PRELOAD", "1") not in ("0", "false", "no")
 # Everything resident at once needs about this much free; below it we stream the
 # weights off the CPU instead, which is slower but always fits.
 FAST_MODE_FREE_GB = float(os.environ.get("IMAGE_EDIT_FAST_MODE_FREE_GB", "18.5"))
@@ -76,9 +85,11 @@ LIGHTNING_SCHEDULER = {
 
 @asynccontextmanager
 async def lifespan(_app: "FastAPI"):
-    """The idle watcher runs for as long as the server does."""
+    """Bring the model up beside the server, not inside the first request."""
     threading.Thread(target=idle_watch, daemon=True).start()
     log(f"image-edit listening on http://{HOST}:{PORT} - {MODEL_NAME}")
+    if PRELOAD:
+        threading.Thread(target=preload, name="preload", daemon=True).start()
     yield
 
 
@@ -108,6 +119,64 @@ def log(msg: str) -> None:
             pass  # pythonw.exe with no stdout attached
 
 
+# --- nunchaku 1.2.1 against diffusers 0.40 ------------------------------------
+
+
+def bridge_to_diffusers(transformer) -> None:
+    """Teach nunchaku's transformer the calling convention diffusers 0.40 uses.
+
+    Nunchaku 1.2.1 is written against diffusers 0.36 (what its CI pins), and two
+    things moved in between, both around the text length that RoPE needs:
+
+    * `QwenEmbedRope.forward` was `(video_fhw, max_txt_seq_len, device)` and is
+      now `(video_fhw, device, max_txt_seq_len)`. Nunchaku passes the length
+      positionally *and* device by keyword, so the call dies outright with
+      `QwenEmbedRope.forward() got multiple values for argument 'device'`.
+    * the pipeline no longer passes `txt_seq_lens` to the transformer at all;
+      0.40 derives the length from the mask inside its own forward. Nunchaku's
+      forward never learned that and hands RoPE a `None`.
+
+    Both are bridged here. Pinning diffusers back to 0.36 would be the other
+    way out, but it would drag transformers back below 5 with it, and the text
+    encoder is loaded by transformers.
+    """
+    from diffusers.models.transformers.transformer_qwenimage import (
+        compute_text_seq_len_from_mask,
+    )
+
+    rope = getattr(transformer, "pos_embed", None)
+    if rope is not None:
+        order = list(inspect.signature(type(rope).forward).parameters)
+        if "device" in order and "max_txt_seq_len" in order:
+            if order.index("device") < order.index("max_txt_seq_len"):
+                unbound = type(rope).forward
+
+                def rope_forward(video_fhw, max_txt_seq_len=None, device=None, **kw):
+                    # nunchaku's second positional argument is a list of lengths;
+                    # 0.40 wants the single number RoPE is sized for.
+                    if isinstance(max_txt_seq_len, (list, tuple)):
+                        max_txt_seq_len = max(max_txt_seq_len) if max_txt_seq_len else None
+                    return unbound(
+                        rope, video_fhw, device=device, max_txt_seq_len=max_txt_seq_len, **kw
+                    )
+
+                rope.forward = rope_forward
+
+    inner = transformer.forward
+
+    def forward(*args, **kwargs):
+        if kwargs.get("txt_seq_lens") is None and kwargs.get("encoder_hidden_states") is not None:
+            # Exactly how 0.40's own transformer sizes RoPE, so the bridge cannot
+            # drift from it: the full encoder sequence length, mask or no mask.
+            seq_len, _, _ = compute_text_seq_len_from_mask(
+                kwargs["encoder_hidden_states"], kwargs.get("encoder_hidden_states_mask")
+            )
+            kwargs["txt_seq_lens"] = [int(seq_len)]
+        return inner(*args, **kwargs)
+
+    transformer.forward = forward
+
+
 # --- the model ----------------------------------------------------------------
 
 
@@ -119,6 +188,51 @@ class Editor:
         self.pipe = None
         self.mode = None
         self.last_used = 0.0
+        # The weights are fetched once, at startup, and never from inside a
+        # request. Until this is set, /edit refuses instead of waiting.
+        self.weights = threading.Event()
+        self.weights_lock = threading.Lock()
+        self.weights_error: Optional[str] = None
+        self.transformer_path: Optional[str] = None
+        self.loading = False
+
+    # -- the weights on disk --
+
+    def ensure_weights(self) -> None:
+        """Resolve both repos to local files, downloading whatever is missing.
+
+        Only ever called off the request path: a download is minutes to hours,
+        and the fleet's HTTP client gives up after 300 s.
+        """
+        if self.weights.is_set():
+            return
+        with self.weights_lock:
+            if self.weights.is_set():
+                return
+            from huggingface_hub import hf_hub_download, snapshot_download
+
+            base_kw = {
+                "ignore_patterns": ["transformer/*.safetensors", "transformer/*.index.json"]
+            }
+            t0 = time.time()
+            try:
+                self.transformer_path = hf_hub_download(
+                    NUNCHAKU_REPO, NUNCHAKU_FILE, local_files_only=True
+                )
+                snapshot_download(BASE_REPO, local_files_only=True, **base_kw)
+                log("weights already on disk")
+            except Exception:  # noqa: BLE001 - any cache miss means: go and fetch
+                log("weights incomplete; fetching (not on a request path)")
+                try:
+                    snapshot_download(BASE_REPO, max_workers=4, **base_kw)
+                    self.transformer_path = hf_hub_download(NUNCHAKU_REPO, NUNCHAKU_FILE)
+                except Exception as e:  # noqa: BLE001
+                    self.weights_error = f"{type(e).__name__}: {e}"
+                    log(f"weights could not be fetched: {self.weights_error}")
+                    raise
+                log(f"weights fetched in {time.time() - t0:.0f}s")
+            self.weights_error = None
+            self.weights.set()
 
     # -- VRAM housekeeping --
 
@@ -126,6 +240,11 @@ class Editor:
     def free_gb() -> float:
         free, _total = torch.cuda.mem_get_info()
         return free / 1e9
+
+    @staticmethod
+    def used_gb() -> float:
+        free, total = torch.cuda.mem_get_info()
+        return (total - free) / 1e9
 
     @staticmethod
     def ask_ollama_to_unload() -> bool:
@@ -159,18 +278,24 @@ class Editor:
 
     def _build(self, lean: bool):
         from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
-        from huggingface_hub import hf_hub_download
         from nunchaku.models.transformers.transformer_qwenimage import (
             NunchakuQwenImageTransformer2DModel,
         )
 
-        path = hf_hub_download(NUNCHAKU_REPO, NUNCHAKU_FILE)
+        # The path was resolved at startup, and the base repo is read with
+        # local_files_only: a load can never turn into a download, neither at
+        # startup nor on the request that follows an idle unload.
         transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(
-            path, torch_dtype=torch.bfloat16, offload=lean
+            self.transformer_path, torch_dtype=torch.bfloat16, offload=lean
         )
+        bridge_to_diffusers(transformer)
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(LIGHTNING_SCHEDULER)
         pipe = QwenImageEditPlusPipeline.from_pretrained(
-            BASE_REPO, transformer=transformer, scheduler=scheduler, torch_dtype=torch.bfloat16
+            BASE_REPO,
+            transformer=transformer,
+            scheduler=scheduler,
+            torch_dtype=torch.bfloat16,
+            local_files_only=True,
         )
         pipe.set_progress_bar_config(disable=True)
         if lean:
@@ -188,6 +313,11 @@ class Editor:
     def ensure_loaded(self) -> None:
         if self.pipe is not None:
             return
+        if not self.weights.is_set():
+            raise RuntimeError(
+                "model weights are not on disk yet"
+                + (f" ({self.weights_error})" if self.weights_error else " (being fetched)")
+            )
         free = self.free_gb()
         if free < FAST_MODE_FREE_GB and YIELD_OLLAMA and self.ask_ollama_to_unload():
             free = self.free_gb()
@@ -195,20 +325,27 @@ class Editor:
         if lean and free < LEAN_MODE_FREE_GB:
             log(f"only {free:.1f} GB of VRAM free; loading lean anyway")
         t0 = time.time()
+        self.loading = True
         log(f"loading {MODEL_NAME} ({'lean' if lean else 'fast'} mode, {free:.1f} GB free)")
         try:
-            self.pipe = self._build(lean)
-            self.mode = "lean" if lean else "fast"
-        except torch.cuda.OutOfMemoryError:
-            if lean:
-                raise
-            log("out of memory in fast mode; falling back to lean")
-            self.pipe = None
-            gc.collect()
-            torch.cuda.empty_cache()
-            self.pipe = self._build(True)
-            self.mode = "lean"
-        log(f"loaded in {time.time() - t0:.0f}s ({self.mode} mode)")
+            try:
+                self.pipe = self._build(lean)
+                self.mode = "lean" if lean else "fast"
+            except torch.cuda.OutOfMemoryError:
+                if lean:
+                    raise
+                log("out of memory in fast mode; falling back to lean")
+                self.pipe = None
+                gc.collect()
+                torch.cuda.empty_cache()
+                self.pipe = self._build(True)
+                self.mode = "lean"
+        finally:
+            self.loading = False
+        log(
+            f"loaded in {time.time() - t0:.0f}s ({self.mode} mode); "
+            f"{self.used_gb():.1f} GB of VRAM in use"
+        )
 
     def unload(self, why: str) -> None:
         if self.pipe is None:
@@ -246,6 +383,22 @@ class Editor:
 
 
 editor = Editor()
+
+
+def preload() -> None:
+    """Fetch what is missing, then load, while the server already answers."""
+    try:
+        editor.ensure_weights()
+    except Exception:  # noqa: BLE001 - already logged, and /edit says why
+        return
+    try:
+        with editor.lock:
+            editor.ensure_loaded()
+        # Start the idle clock now, so a server nobody calls still lets go
+        # eventually instead of holding the weights for ever.
+        editor.last_used = time.time()
+    except Exception as e:  # noqa: BLE001
+        log(f"preload failed: {e!r}")
 
 
 def generation_size(w: int, h: int) -> "tuple[int, int]":
@@ -294,7 +447,15 @@ class EditRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": MODEL_NAME, "loaded": editor.pipe is not None}
+    """Answers at once, whatever the model happens to be doing."""
+    return {
+        "ok": True,
+        "model": MODEL_NAME,
+        "loaded": editor.pipe is not None,
+        "loading": editor.loading,
+        "weights": editor.weights.is_set(),
+        "mode": editor.mode,
+    }
 
 
 @app.post("/edit")
@@ -305,6 +466,13 @@ def edit(req: EditRequest):
         prompt = (req.prompt or "").strip()
         if not prompt:
             raise ValueError("prompt is empty")
+        if not editor.weights.wait(timeout=30):
+            # Startup resolves cached weights in the background. Give a request
+            # arriving at the same instant a chance to join the cold load.
+            return JSONResponse(
+                status_code=503,
+                content={"error": "model weights are still being fetched; retry later"},
+            )
         with editor.lock:
             out = editor.edit(image, prompt, req.seed, req.steps)
         ms = int((time.time() - t0) * 1000)

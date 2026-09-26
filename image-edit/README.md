@@ -63,9 +63,11 @@ Failures come back as HTTP 500 with `{"error": "TypeName: message"}`.
 The 3090 also holds the 3D pipelines and Ollama's 27B, so the editor tries to be
 a good neighbour:
 
-- **Lazy.** Nothing is loaded until the first `/edit`. `/health` stays instant.
+- **Preloaded.** Startup resolves the cached weights and loads the pipeline in a
+  background thread. `/health` stays instant. An edit arriving during that load
+  waits for it, keeping the first request inside the fleet's 300 s HTTP limit.
 - **Dropped when idle.** A watcher thread unloads the pipeline after
-  `IMAGE_EDIT_IDLE_UNLOAD_MIN` (10) idle minutes and empties the CUDA cache.
+  `IMAGE_EDIT_IDLE_UNLOAD_MIN` (60) idle minutes and empties the CUDA cache.
 - **One at a time.** A lock around the edit; concurrent calls queue.
 - **Two load modes.** With ≥ 18.5 GB free it loads *fast*
   (`enable_model_cpu_offload`, one module on the GPU at a time). Below that it
@@ -155,7 +157,8 @@ Downloads resume — `fetch_models.py` is safe to re-run and picks up the
 | variable | default | |
 |---|---|---|
 | `IMAGE_EDIT_HOST` / `IMAGE_EDIT_PORT` | `127.0.0.1` / `8410` | |
-| `IMAGE_EDIT_IDLE_UNLOAD_MIN` | `10` | idle minutes before the model is dropped |
+| `IMAGE_EDIT_IDLE_UNLOAD_MIN` | `60` | idle minutes before the model is dropped |
+| `IMAGE_EDIT_PRELOAD` | `1` | resolve weights and load in the background at startup |
 | `IMAGE_EDIT_STEPS` | `8` | Lightning's number; leave it |
 | `IMAGE_EDIT_FAST_MODE_FREE_GB` | `18.5` | free VRAM needed for fast mode |
 | `IMAGE_EDIT_YIELD_OLLAMA` | `1` | ask Ollama to unload when VRAM is short |
