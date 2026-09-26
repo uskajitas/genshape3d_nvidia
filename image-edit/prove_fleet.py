@@ -10,6 +10,7 @@ import json
 import sys
 import time
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 from PIL import Image
@@ -33,7 +34,11 @@ def main() -> None:
         stream = io.BytesIO()
         im.save(stream, "JPEG", quality=92, subsampling=0)
     data_url = "data:image/jpeg;base64," + base64.b64encode(stream.getvalue()).decode()
-    headers = {"content-type": "application/json", "x-node-key": kit["nodeKey"]}
+    headers = {
+        "content-type": "application/json",
+        "x-node-key": kit["nodeKey"],
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    }
     root = kit["controlPlane"].rstrip("/") + "/api"
 
     def call(method: str, path: str, body=None):
@@ -43,8 +48,11 @@ def main() -> None:
             headers=headers,
             method=method,
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.load(response)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            raise RuntimeError(f"fleet HTTP {error.code}: {error.read()[:1000]!r}") from error
 
     started = time.monotonic()
     job = call(
