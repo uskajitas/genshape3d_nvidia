@@ -32,7 +32,10 @@ import torch
 #   index 4 (~270° azimuth) -> 'left'
 # The "front" view is the user's original input image (provided separately
 # by generate.py, NOT from Zero123++).
-INDEX_TO_LABEL = {2: 'back', 4: 'left'}
+INDEX_TO_LABEL = {1: 'side', 2: 'back', 4: 'left'}
+# which of those a caller wants cleaned, squared and returned (default: the
+# Hunyuan triplet, unchanged for 3D jobs)
+WANTED = {'back', 'left'}
 
 
 def emit_progress(pct: int, detail: str = '') -> None:
@@ -45,7 +48,10 @@ def main() -> int:
     ap.add_argument('--image', required=True, help='input image path')
     ap.add_argument('--output-dir', required=True, help='where to write the 6 PNGs')
     ap.add_argument('--steps', type=int, default=36)
+    ap.add_argument('--labels', default='back,left', help='which labelled views to return: side,back,left')
     args = ap.parse_args()
+    global WANTED
+    WANTED = {x.strip() for x in args.labels.split(',') if x.strip()}
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -124,7 +130,7 @@ def main() -> int:
             crop = out.crop((c * cw, r * ch, (c + 1) * cw, (r + 1) * ch))
             label = INDEX_TO_LABEL.get(i, f'v{i}')
             # rembg expects RGBA; convert if needed.
-            if bg_remover is not None and label in INDEX_TO_LABEL.values():
+            if bg_remover is not None and label in WANTED:
                 rgba = crop if crop.mode == 'RGBA' else crop.convert('RGBA')
                 try:
                     crop = bg_remover(rgba)
@@ -132,11 +138,11 @@ def main() -> int:
                     print(f'[mv] WARN: bg removal failed for {label} ({e}); using raw crop', flush=True)
             # Make every canonical aux view square + 512px so mv kernels
             # see the shape they expect. Unmapped views (v3/v5) saved raw.
-            if label in INDEX_TO_LABEL.values():
+            if label in WANTED:
                 crop = square_pad_resize(crop, 512)
             path = os.path.join(args.output_dir, f'{label}.png')
             crop.save(path)
-            if label in INDEX_TO_LABEL.values():
+            if label in WANTED:
                 paths[label] = path
 
     emit_progress(100, 'Done')

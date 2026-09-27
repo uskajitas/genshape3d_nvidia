@@ -25,17 +25,25 @@ class Worker extends EventEmitter {
     super();
     this.config = config;
     this.workerId = WORKER_ID;
-    const isLocal = /@(localhost|127\.0\.0\.1)/.test(config.databaseUrl || '');
-    this.pool = new Pool({
-      connectionString: config.databaseUrl,
-      ssl: isLocal ? false : { rejectUnauthorized: false },
-      max: 3,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
-    });
-    this.pool.on('error', (err) => {
-      console.error('[Worker] Pool error (will reconnect):', err.message);
-    });
+    // Postgres runs plain TCP on the private LAN (no SSL) — both on the i7
+    // itself (127.0.0.1) and for LAN boxes (192.168.20.16). The trust
+    // boundary is the LAN, not TLS. Opt back into SSL only if DB_SSL=1.
+    const useSsl = process.env.DB_SSL === '1';
+    this._makePool = () => {
+      const pool = new Pool({
+        connectionString: config.databaseUrl,
+        ssl: useSsl ? { rejectUnauthorized: false } : false,
+        keepAlive: true,
+        max: 3,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000,
+      });
+      pool.on('error', (err) => {
+        console.error('[Worker] Pool error (will reconnect):', err.message);
+      });
+      return pool;
+    };
+    this.pool = this._makePool();
     this.s3 = new S3Client({
       region: 'auto',
       endpoint: config.r2Endpoint,
@@ -66,6 +74,8 @@ class Worker extends EventEmitter {
       completedJobs: this.completedJobs.slice(0, 20),
       failedJobs: this.failedJobs.slice(0, 20),
       cancelledJobs: this.cancelledJobs.slice(0, 20),
+      // All-time totals per status (the lists above are recent-only/capped)
+      counts: this.counts || null,
       isProcessing: this.processing,
       maxConcurrent: this.maxConcurrent,
       activeCount: this.activeCount,
@@ -114,8 +124,47 @@ class Worker extends EventEmitter {
     } catch (e) {
       console.warn(`[Worker] Texture orphan cleanup failed (non-fatal): ${e.message}`);
     }
+    // Orphan cleanup for refine jobs
+    try {
+      const refOrphaned = await this.pool.query(
+        `UPDATE genshape3d_refine_jobs
+            SET status='failed', "completedAt"=NOW(), "updatedAt"=NOW(),
+                "progressPhase"='orphaned-by-worker-restart',
+                "errorMessage" = COALESCE(NULLIF("errorMessage", ''), 'worker process was restarted mid-job')
+          WHERE status='processing' AND "assignedWorkerId"=$1
+          RETURNING id`,
+        [this.workerId],
+      );
+      if (refOrphaned.rowCount > 0) {
+        console.log(`[Worker] Cleared ${refOrphaned.rowCount} orphan refine job(s) from previous run.`);
+      }
+    } catch (e) {
+      console.warn(`[Worker] Refine orphan cleanup failed (non-fatal): ${e.message}`);
+    }
     this.poll();
     this.pollTimer = setInterval(() => this.poll(), this.config.pollInterval);
+
+    // Stuck-poll watchdog. After a DB outage, pg-pool can end up with every
+    // client stuck: the next pool.query() waits forever for a free client,
+    // `_polling` never resets, and every later tick returns instantly — the
+    // worker looks alive but silently stops claiming jobs forever (this
+    // exact failure ate an afternoon of texture jobs on 2026-08-17). If a
+    // single poll has been "in flight" for over 3 minutes, destroy the pool,
+    // build a fresh one, and let the loop resume.
+    this.pollWatchdogTimer = setInterval(() => {
+      if (this._polling && this._pollStartedAt && Date.now() - this._pollStartedAt > 180000) {
+        console.error('[Worker] Poll stuck for >3min — resetting DB pool and poll state.');
+        this.resetPool();
+        this._polling = false;
+      }
+    }, 60000);
+  }
+
+  resetPool() {
+    const old = this.pool;
+    this.pool = this._makePool();
+    if (old) old.end().catch(() => { /* already broken */ });
+    console.log('[Worker] DB pool recreated.');
   }
 
   async ensureTable() {
@@ -164,6 +213,9 @@ class Worker extends EventEmitter {
         ['"progressStep"',   'INTEGER NOT NULL DEFAULT 0'],
         ['"progressTotal"',  'INTEGER NOT NULL DEFAULT 0'],
         ['"requestCancel"',  'BOOLEAN NOT NULL DEFAULT false'],
+        ['"rootJobId"',      "TEXT NOT NULL DEFAULT ''"],
+        ['version',          'INTEGER NOT NULL DEFAULT 1'],
+        ['"versionLabel"',   "TEXT NOT NULL DEFAULT ''"],
         ['"errorMessage"',   "TEXT NOT NULL DEFAULT ''"],
         ['"octreeResolution"', 'INTEGER NOT NULL DEFAULT 0'],
         ['"targetFaceCount"',  'INTEGER NOT NULL DEFAULT 0'],
@@ -171,6 +223,7 @@ class Worker extends EventEmitter {
         ['"guidanceScale"',    'REAL NOT NULL DEFAULT 0'],
         ['"numChunks"',        'INTEGER NOT NULL DEFAULT 0'],
         ['"seed"',             'INTEGER NOT NULL DEFAULT 0'],
+        ['"previewUrl"',       "TEXT NOT NULL DEFAULT ''"],
       ];
       for (const [col, type] of newCols) {
         try {
@@ -236,6 +289,7 @@ class Worker extends EventEmitter {
     // but the guard keeps things clean and predictable.
     if (this._polling) return;
     this._polling = true;
+    this._pollStartedAt = Date.now();
 
     // Heartbeat so we can confirm the loop is alive even when there's
     // nothing to claim. Logged once every ~30s of polling.
@@ -260,6 +314,36 @@ class Worker extends EventEmitter {
         [models, this.workerId]
       );
       this._pendingForClaim = pending;
+
+      // ── Stale-pending takeover ─────────────────────────────────
+      // Guarantee: no job sits pending forever just because it was routed to
+      // a worker that's offline. If a pending job addressed to ANOTHER worker
+      // has waited > TAKEOVER_AFTER_MIN (default 10) and this machine can run
+      // its model, we claim it. Env-gated (TAKEOVER_STALE_PENDING=true in the
+      // 3090's .env) so the 1080 — which can't run textured/hi3dgen work —
+      // never steals jobs it would hang on. Textured jobs are additionally
+      // excluded unless this machine lists hunyuan3d-2-1 (a texture-capable
+      // stack implies the paint pipeline fits in VRAM).
+      if ((process.env.TAKEOVER_STALE_PENDING || '').toLowerCase() === 'true') {
+        const afterMin = parseInt(process.env.TAKEOVER_AFTER_MIN || '10', 10);
+        const canTexture = models.includes('hunyuan3d-2-1');
+        const { rows: stale } = await this.pool.query(
+          `SELECT * FROM genshape3d_jobs
+           WHERE status = 'pending'
+             AND model = ANY($1::text[])
+             AND "preferredWorkerId" <> '' AND "preferredWorkerId" IS NOT NULL
+             AND "preferredWorkerId" <> $2
+             AND "createdAt"::timestamptz < NOW() - ($3 || ' minutes')::interval
+             ${canTexture ? '' : 'AND "doTexture" = false'}
+           ORDER BY "createdAt" ASC`,
+          [models, this.workerId, afterMin]
+        );
+        if (stale.length > 0) {
+          console.log(`[Worker] taking over ${stale.length} stale pending job(s) addressed to an offline worker.`);
+          this._pendingForClaim.push(...stale);
+        }
+      }
+
       this.pendingJobs = [];
 
       // ── Processing — only this machine's ──────────────────────
@@ -267,31 +351,94 @@ class Worker extends EventEmitter {
         `SELECT * FROM genshape3d_jobs WHERE status = 'processing' AND "assignedWorkerId" = $1 ORDER BY "startedAt" ASC`,
         [this.workerId]
       );
-      this.processingJobs = processing;
+      // Texture jobs live in their own table but must ALSO appear here:
+      // the tray UI renders this list (otherwise it says "processing 0"
+      // during a paint), and isHeavy() below reads it for GPU exclusivity
+      // (otherwise a mesh job could start mid-paint). mapTexJob converts a
+      // texture row to the job-card shape shared with regular jobs.
+      const mapTexJob = (t) => ({
+        id: t.id,
+        name: `[TEX] ${t.materialPreset && t.materialPreset !== 'Auto' ? t.materialPreset : (t.prompt || 'texture')}`.slice(0, 60),
+        model: 'hunyuan3d-2-1',
+        doTexture: true,
+        isTexture: true,
+        status: t.status,
+        progressPct: t.progressPct,
+        progressPhase: t.progressPhase,
+        startedAt: t.startedAt,
+        completedAt: t.completedAt,
+        createdAt: t.createdAt,
+        imageUrl: t.sourceImageUrl || '',
+        resultUrl: t.resultUrl || '',
+        errorMessage: t.errorMessage || '',
+        userEmail: t.userEmail,
+      });
+      const { rows: texProcessing } = await this.pool.query(
+        `SELECT * FROM genshape3d_texture_jobs WHERE status = 'processing' AND "assignedWorkerId" = $1 ORDER BY "startedAt" ASC`,
+        [this.workerId]
+      );
+      this.processingJobs = [...processing, ...texProcessing.map(mapTexJob)];
 
-      // ── Cancelled — only this machine's ───────────────────────
+      // Heartbeat: bump updatedAt on our running jobs every poll. The server's
+      // stuck-job sweeper requeues 'processing' rows whose updatedAt is stale
+      // >30 min — runners can legitimately go long stretches without PROGRESS
+      // lines (paint step), so without this a healthy job could get requeued
+      // out from under us. With it, staleness == this worker is actually dead.
+      if (processing.length > 0) {
+        await this.pool.query(
+          `UPDATE genshape3d_jobs SET "updatedAt" = NOW() WHERE status = 'processing' AND "assignedWorkerId" = $1`,
+          [this.workerId]
+        ).catch(() => { /* non-fatal */ });
+      }
+
+      // ── Recent lists — only this machine's, last 24h, capped ──────────────
+      // The lists are a "what happened recently" view, NOT full history —
+      // keeps the tray UI light no matter how many jobs accumulate. True
+      // all-time totals come from the counts query below.
+      const RECENT = `AND "completedAt"::timestamptz > NOW() - INTERVAL '24 hours'`;
+
       const { rows: cancelled } = await this.pool.query(
-        `SELECT * FROM genshape3d_jobs WHERE status = 'cancelled' AND "assignedWorkerId" = $1 ORDER BY "completedAt" DESC LIMIT 20`,
+        `SELECT * FROM genshape3d_jobs WHERE status = 'cancelled' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
         [this.workerId]
       );
       this.cancelledJobs = cancelled;
 
-      // ── Completed (done) — only this machine's ────────────────
-      // Sourced from the DB so history survives worker restarts. The
-      // in-memory unshift on jobComplete still happens but is now a
-      // best-effort cache, not the source of truth.
-      const { rows: completed } = await this.pool.query(
-        `SELECT * FROM genshape3d_jobs WHERE status = 'done' AND "assignedWorkerId" = $1 ORDER BY "completedAt" DESC LIMIT 20`,
-        [this.workerId]
-      );
-      this.completedJobs = completed;
+      // Finished paints join the history lists (they used to vanish once
+      // done). mapTexJob is defined next to the processing merge above.
+      const byCompletedDesc = (a, b) =>
+        new Date(b.completedAt || 0).getTime() - new Date(a.completedAt || 0).getTime();
 
-      // ── Failed — only this machine's ──────────────────────────
-      const { rows: failed } = await this.pool.query(
-        `SELECT * FROM genshape3d_jobs WHERE status = 'failed' AND "assignedWorkerId" = $1 ORDER BY "completedAt" DESC LIMIT 20`,
+      const { rows: completed } = await this.pool.query(
+        `SELECT * FROM genshape3d_jobs WHERE status = 'done' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
         [this.workerId]
       );
-      this.failedJobs = failed;
+      const { rows: texCompleted } = await this.pool.query(
+        `SELECT * FROM genshape3d_texture_jobs WHERE status = 'done' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
+        [this.workerId]
+      );
+      this.completedJobs = [...completed, ...texCompleted.map(mapTexJob)]
+        .sort(byCompletedDesc).slice(0, 20);
+
+      const { rows: failed } = await this.pool.query(
+        `SELECT * FROM genshape3d_jobs WHERE status = 'failed' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
+        [this.workerId]
+      );
+      const { rows: texFailed } = await this.pool.query(
+        `SELECT * FROM genshape3d_texture_jobs WHERE status = 'failed' AND "assignedWorkerId" = $1 ${RECENT} ORDER BY "completedAt" DESC LIMIT 20`,
+        [this.workerId]
+      );
+      this.failedJobs = [...failed, ...texFailed.map(mapTexJob)]
+        .sort(byCompletedDesc).slice(0, 20);
+
+      // ── True all-time totals for the stat boxes ────────────────────────────
+      const { rows: countRows } = await this.pool.query(
+        `SELECT status, COUNT(*)::int AS n FROM genshape3d_jobs WHERE "assignedWorkerId" = $1 GROUP BY status`,
+        [this.workerId]
+      );
+      const counts = { done: 0, failed: 0, cancelled: 0, processing: 0 };
+      for (const r of countRows) if (r.status in counts) counts[r.status] = r.n;
+      counts.pending = this._pendingForClaim.length; // claimable by this worker
+      this.counts = counts;
 
       // Check for requestCancel from the web frontend
       if (this.currentJob) {
@@ -322,17 +469,26 @@ class Worker extends EventEmitter {
       if (this.activeCount < this.maxConcurrent && this._pendingForClaim.length > 0) {
         const nextJob = this._pendingForClaim.find(j => !j.requestCancel);
         if (nextJob) {
-          // VRAM safety guard: two textured Hunyuan3D jobs together OOM
-          // a 24 GB card (each is ~6 GB shape + ~6 GB paint, and 2.1's PBR
-          // paint is heavier still). Hold the pending one until the running
-          // one finishes.
-          const isTexHun = (j) => {
+          // VRAM safety guard — heavy jobs get the GPU EXCLUSIVELY.
+          // "Heavy" = textured Hunyuan3D (2.0/2.1 shape+paint pipes) or
+          // hi3dgen (trellis pipeline). Any two heavy-ish pipelines sharing
+          // the 24 GB card exhaust VRAM; on Windows WDDM then silently spills
+          // to system RAM and both jobs crawl for hours at 99% GPU (this
+          // exact pairing — hi3dgen + textured-2.1 — cost a 12h hang).
+          // Rule: a heavy job can't start while ANYTHING else runs, and
+          // nothing can start while a heavy job runs.
+          const isHeavy = (j) => {
             const m = (j.model || 'hunyuan3d').toLowerCase();
-            return (m === 'hunyuan3d' || m === 'hunyuan3d-2-1') && j.doTexture;
+            return ((m === 'hunyuan3d' || m === 'hunyuan3d-2-1') && j.doTexture) || m === 'hi3dgen' || m === 'trellis2';
           };
-          const oomRisk = isTexHun(nextJob) && this.processingJobs.some(isTexHun);
-          if (oomRisk) {
-            console.log(`[Worker] holding ${nextJob.id.slice(0,8)} — another textured-Hunyuan3D job is already running (would OOM).`);
+          const heavyRunning = this.processingJobs.some(isHeavy);
+          // refineActive: a running refine (Poisson rebuild + bake eats RAM
+          // and some GPU) must also block heavy jobs — a trellis2 load next
+          // to a rebuild starved and died with a misleading HF-404 error.
+          const blocked = heavyRunning
+            || (isHeavy(nextJob) && (this.processingJobs.length > 0 || this.refineActive));
+          if (blocked) {
+            console.log(`[Worker] holding ${nextJob.id.slice(0,8)} — GPU exclusivity (heavy job running or queued job is heavy).`);
           } else {
             this.processJob(nextJob);
           }
@@ -340,9 +496,9 @@ class Worker extends EventEmitter {
       }
 
       // ── Texture jobs ──────────────────────────────────────────────────────
-      // Only pick up texture work when we have capacity and are not already
-      // running a shape job (texture paint is heavy on VRAM too).
-      if (this.activeCount < this.maxConcurrent) {
+      // Texture paint is heavy — same GPU-exclusivity rule as above: only
+      // pick one up when NOTHING else is running on this worker.
+      if (this.activeCount === 0) {
         try {
           const { rows: texPending } = await this.pool.query(
             `SELECT * FROM genshape3d_texture_jobs
@@ -358,9 +514,54 @@ class Worker extends EventEmitter {
           console.warn(`[Worker] Texture job poll failed (non-fatal): ${texErr.message}`);
         }
       }
+
+      // ── Refine jobs (mesh repair/retopo) ──────────────────────────────────
+      // CPU-only and fast (~10 s) but keep the same only-when-idle gate for
+      // simplicity — the queue drains quickly anyway.
+      if (this.activeCount === 0) {
+        try {
+          const { rows: refPending } = await this.pool.query(
+            `SELECT * FROM genshape3d_refine_jobs
+             WHERE status = 'pending' AND deleted = false
+             ORDER BY "createdAt" ASC
+             LIMIT 1`,
+          );
+          if (refPending.length > 0) {
+            console.log(`[Worker] Picking up refine job ${refPending[0].id.slice(0, 8)}`);
+            this.processRefineJob(refPending[0]);
+          }
+        } catch (refErr) {
+          console.warn(`[Worker] Refine job poll failed (non-fatal): ${refErr.message}`);
+        }
+      }
+
+      // ── Segment jobs (PartField part segmentation) ────────────────────────
+      // GPU inference but light (~4 GB VRAM, 1-3 min) — same only-when-idle
+      // gate as refine keeps the exclusivity logic trivial.
+      if (this.activeCount === 0 && fs.existsSync('C:/projects/genshape-worker-3090/runners/partfield/run.py')) {
+        try {
+          const { rows: segPending } = await this.pool.query(
+            `SELECT * FROM genshape3d_segment_jobs
+             WHERE status = 'pending' AND deleted = false
+             ORDER BY "createdAt" ASC
+             LIMIT 1`,
+          );
+          if (segPending.length > 0) {
+            console.log(`[Worker] Picking up segment job ${segPending[0].id.slice(0, 8)}`);
+            this.processSegmentJob(segPending[0]);
+          }
+        } catch (segErr) {
+          console.warn(`[Worker] Segment job poll failed (non-fatal): ${segErr.message}`);
+        }
+      }
     } catch (err) {
       console.error('[Worker] Poll error:', err.message);
       console.error(err.stack);
+      // Connection-class errors poison the pool's clients — recreate it now
+      // instead of letting the next poll hang on a dead client.
+      if (/timeout|terminat|ECONNRESET|ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT/i.test(err.message || '')) {
+        this.resetPool();
+      }
     } finally {
       this._polling = false;
     }
@@ -434,6 +635,27 @@ class Worker extends EventEmitter {
         console.log(`[Worker] Using ${auxImagePaths.length} auxiliary view(s) for multi-view conditioning.`);
       }
 
+      // ── A 'multiview' job: the sides ARE the result ───────────────
+      // The Bench asks for the other sides of a picture as a job of its
+      // own — Zero123++ on this GPU, no Replicate. The views go to R2 the
+      // same way the auto-mv step's do; the row is marked done with the
+      // back view as its result so the ordinary "done + resultUrl" test
+      // holds, and the server reads the labelled keys from auxImageUrls.
+      if ((job.model || '').toLowerCase() === 'multiview') {
+        const generated = await this.generateLocalMultiView(inputImagePath, tmpDir, job.id, 'side,back,left');
+        if (!generated.r2Urls || generated.r2Urls.length === 0) throw new Error('Zero123++ produced no views');
+        const completedAt = new Date().toISOString();
+        await this.pool.query(
+          `UPDATE genshape3d_jobs SET status = 'done', "resultUrl" = $1, "auxImageUrls" = $2::jsonb, "completedAt" = $3, "progressPct" = 100, "progressPhase" = 'Sides drawn', "updatedAt" = NOW() WHERE id = $4`,
+          [generated.r2Urls[0], JSON.stringify(generated.r2Urls), completedAt, job.id]
+        );
+        job.status = 'done'; job.resultUrl = generated.r2Urls[0]; job.auxImageUrls = generated.r2Urls; job.completedAt = completedAt;
+        this.completedJobs.unshift(job);
+        this.emit('jobComplete', job);
+        console.log(`[Worker] multiview job ${job.id.slice(0, 8)}: ${generated.r2Urls.length} view(s) drawn`);
+        return;
+      }
+
       // ── Local multi-view auto-generation ─────────────────────────
       // If no aux views came in with the job, generate them right here
       // on this machine using Zero123++ (no Replicate, no API).
@@ -501,7 +723,7 @@ class Worker extends EventEmitter {
 
       let glbPath;
       try {
-        glbPath = await this.callRunner(model, inputImagePath, tmpDir, genParams, auxImagePaths);
+        glbPath = await this.callRunner(model, inputImagePath, tmpDir, genParams, auxImagePaths, job);
       } finally {
         const gpu = await stopGpu();
         try {
@@ -524,17 +746,46 @@ class Worker extends EventEmitter {
       const outputUrl = await this.uploadToR2(glbPath);
       console.log(`[Worker] Uploaded GLB to ${outputUrl}`);
 
+      // Streaming preview: JPEG textures + meshopt geometry (~8x smaller).
+      // Best-effort — a failed preview never fails the job.
+      let previewUrl = '';
+      try {
+        previewUrl = await this.makePreview(glbPath);
+      } catch (e) {
+        console.error(`[Worker] preview build failed (serving full GLB): ${e.message}`);
+      }
+
       // Update job as complete
       const completedAt = new Date().toISOString();
       await this.pool.query(
-        `UPDATE genshape3d_jobs SET status = 'done', "resultUrl" = $1, "completedAt" = $2, "progressPct" = 100, "progressPhase" = 'Generation complete!', "updatedAt" = NOW() WHERE id = $3`,
-        [outputUrl, completedAt, job.id]
+        `UPDATE genshape3d_jobs SET status = 'done', "resultUrl" = $1, "previewUrl" = $4, "completedAt" = $2, "progressPct" = 100, "progressPhase" = 'Generation complete!', "updatedAt" = NOW() WHERE id = $3`,
+        [outputUrl, completedAt, job.id, previewUrl]
       );
       job.status = 'done';
       job.resultUrl = outputUrl;
       job.completedAt = completedAt;
       this.completedJobs.unshift(job);
       this.emit('jobComplete', job);
+
+      // Smart Mesh: generation jobs flagged autoRefine chain straight into
+      // the refine pipeline (rebuild + decimate + unwrap + normal/AO bake)
+      // so the user gets a game-ready retopologized version automatically.
+      if (job.autoRefine) {
+        try {
+          const target = Math.min(Math.max(parseInt(job.targetFaceCount) || 30000, 2000), 200000);
+          await this.pool.query(
+            `INSERT INTO genshape3d_refine_jobs
+               (id, "userEmail", "sourceJobId", "sourceModelUrl", operations)
+             VALUES ($5, $1, $2, $3, $4)`,
+            [job.userEmail, job.id, outputUrl, JSON.stringify({
+              targetFaces: target, fillHoles: true, smooth: 2, keepFrac: 0.02, rebuild: true,
+            }), crypto.randomUUID()]
+          );
+          console.log(`[Worker] autoRefine: queued Smart Mesh refine for ${job.id.slice(0, 8)} (target ${target})`);
+        } catch (e) {
+          console.error(`[Worker] autoRefine enqueue failed for ${job.id}:`, e.message);
+        }
+      }
     } catch (err) {
       console.error(`[Worker] Job ${job.id} failed:`, err && err.stack || err.message);
       const completedAt = new Date().toISOString();
@@ -771,7 +1022,7 @@ else:
    * Returns { localPaths: string[], r2Urls: string[] } — empty arrays
    * on any failure (caller falls back to single-view).
    */
-  async generateLocalMultiView(inputImagePath, tmpDir, jobId) {
+  async generateLocalMultiView(inputImagePath, tmpDir, jobId, labels = 'back,left') {
     const pythonCmd = process.env.PYTHON_CMD || 'python';
     const scriptPath = path.join(__dirname, 'multiview_zero123.py');
     const outDir = path.join(tmpDir, 'mv_views');
@@ -783,7 +1034,7 @@ else:
     });
 
     const result = await new Promise((resolve, reject) => {
-      const proc = spawn(pythonCmd, [scriptPath, '--image', inputImagePath, '--output-dir', outDir], {
+      const proc = spawn(pythonCmd, [scriptPath, '--image', inputImagePath, '--output-dir', outDir, '--labels', labels], {
         cwd: path.dirname(scriptPath),
         env: { ...process.env },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -877,7 +1128,89 @@ else:
    * Same protocol as generate.py: PROGRESS:{...json...} on each step,
    * RESULT:{status, output_path, ...} at end.
    */
-  async callRunner(model, inputImagePath, tmpDir, genParams, auxImagePaths = []) {
+  /**
+   * Hang watchdog for runner subprocesses.
+   *
+   * Why: a VRAM-exhausted CUDA process on Windows doesn't crash — WDDM spills
+   * to system RAM and the job "runs" at 99% GPU for hours with zero output
+   * (two 12h-stuck jobs cost a full night of generation). Progress lines are
+   * sparse during long steps, so liveness = ANY stdout/stderr output.
+   *
+   * Kills the process tree when EITHER:
+   *   - no output at all for STALL_TIMEOUT_MS   (default 15 min), or
+   *   - total runtime exceeds JOB_TIMEOUT_MS    (default 60 min).
+   * Both env-tunable. Killing makes proc 'close' with a signal → the normal
+   * failure path marks the job failed and frees the slot for the next job.
+   *
+   * Returns { touch, stop, killedWhy } — call touch() on every output chunk,
+   * stop() once the process closes; killedWhy() is set if we pulled the plug.
+   */
+  /**
+   * Build the streaming preview GLB next to `glbPath` and upload it.
+   * Textures -> JPEG (normal maps untouched) via make_preview.py in the
+   * hunyuan venv, then meshopt (-cc) via gltfpack. Returns the R2 url.
+   */
+  async makePreview(glbPath) {
+    const path_ = require('path');
+    const dir = path_.dirname(glbPath);
+    const texPath = path_.join(dir, 'preview_tex.glb');
+    const outPath = path_.join(dir, 'preview.glb');
+    const venvPy = 'C:/projects/genshape-worker-3090/runners/hunyuan3d-2-1/.venv/Scripts/python.exe';
+    const script = 'C:/projects/genshape-worker-3090/runners/hunyuan3d-2-1/make_preview.py';
+    const run = (cmd, args) => new Promise((resolve, reject) => {
+      const p = spawn(cmd, args, { shell: process.platform === 'win32' });
+      let err = '';
+      p.stderr.on('data', d => { err += d; });
+      p.on('close', c => c === 0 ? resolve() : reject(new Error(`${cmd} exited ${c}: ${err.slice(0, 300)}`)));
+    });
+    await run(venvPy, [script, glbPath, texPath]);
+    await run('npx', ['--prefix', __dirname + '/..', 'gltfpack', '-i', texPath, '-o', outPath, '-cc']);
+    const url = await this.uploadToR2(outPath);
+    console.log(`[Worker] preview uploaded (${(require('fs').statSync(outPath).size / 1e6).toFixed(1)}MB): ${url}`);
+    return url;
+  }
+
+  attachWatchdog(proc, label) {
+    const STALL_MS = parseInt(process.env.RUNNER_STALL_TIMEOUT_MS || String(15 * 60 * 1000), 10);
+    const HARD_MS  = parseInt(process.env.RUNNER_JOB_TIMEOUT_MS   || String(60 * 60 * 1000), 10);
+    const startedAt = Date.now();
+    let lastOutputAt = Date.now();
+    let killedWhy = null;
+
+    const killTree = (why) => {
+      killedWhy = why;
+      console.error(`[Watchdog] ${label} ${why} — killing PID ${proc.pid}`);
+      try {
+        if (process.platform === 'win32') {
+          // taskkill /T takes the whole tree (python may have spawned children)
+          spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore' });
+        } else {
+          proc.kill('SIGKILL');
+        }
+      } catch (e) {
+        console.error(`[Watchdog] kill failed: ${e.message}`);
+      }
+    };
+
+    const timer = setInterval(() => {
+      const now = Date.now();
+      if (now - startedAt > HARD_MS) {
+        killTree(`exceeded hard timeout (${Math.round(HARD_MS / 60000)} min)`);
+        clearInterval(timer);
+      } else if (now - lastOutputAt > STALL_MS) {
+        killTree(`no output for ${Math.round(STALL_MS / 60000)} min (hung — likely VRAM thrash)`);
+        clearInterval(timer);
+      }
+    }, 30 * 1000);
+
+    return {
+      touch: () => { lastOutputAt = Date.now(); },
+      stop: () => clearInterval(timer),
+      killedWhy: () => killedWhy,
+    };
+  }
+
+  async callRunner(model, inputImagePath, tmpDir, genParams, auxImagePaths = [], job = null) {
     const ext = genParams.file_type || 'glb';
     const outputPath = path.join(tmpDir, `output.${ext}`);
     const { pythonCmd, scriptPath, cwd, env, label } = this.resolveRunner(model);
@@ -917,21 +1250,27 @@ else:
       });
 
       this.currentProc = proc;
+      const watchdog = this.attachWatchdog(proc, label);
 
       let stdout = '';
       let stderr = '';
 
       proc.stdout.on('data', (data) => {
+        watchdog.touch();
         const text = data.toString();
         stdout += text;
         text.split('\n').filter(Boolean).forEach(line => {
           if (line.startsWith('PROGRESS:')) {
             try {
               const progress = JSON.parse(line.slice(9));
-              if (this.currentJob) {
-                this.currentJob.progress = progress;
+              // Attribute progress to THIS runner's job. With MAX_CONCURRENT>1,
+              // this.currentJob is whichever job was claimed last — writing to
+              // it here would corrupt the other running job's progress.
+              const owner = job || this.currentJob;
+              if (owner) {
+                owner.progress = progress;
                 // Write progress to DB for the web frontend
-                this.updateProgress(this.currentJob.id, progress);
+                this.updateProgress(owner.id, progress);
                 this.emit('progressUpdate', progress);
                 this.emit('stateChanged');
               }
@@ -943,6 +1282,7 @@ else:
       });
 
       proc.stderr.on('data', (data) => {
+        watchdog.touch();
         const text = data.toString();
         stderr += text;
         text.split('\n').filter(Boolean).forEach(line => {
@@ -952,6 +1292,10 @@ else:
 
       proc.on('close', (code) => {
         this.currentProc = null;
+        watchdog.stop();
+        if (watchdog.killedWhy()) {
+          return reject(new Error(`${label} killed by watchdog: ${watchdog.killedWhy()}`));
+        }
         if (code !== 0) {
           return reject(new Error(`${label} process exited with code ${code}: ${stderr.slice(-500)}`));
         }
@@ -1029,6 +1373,29 @@ else:
       const meshPath = await this.downloadFromR2(job.sourceModelUrl, tmpDir, 'source_mesh');
       console.log(`[TextureWorker] Downloaded mesh → ${meshPath}`);
 
+      // When texturing a refined derivative, also fetch the lineage's v1
+      // original as bake_source.glb — the runner bakes a tangent-space
+      // normal map from it so the painted low-poly keeps the original's
+      // surface detail. Non-fatal if anything here fails.
+      try {
+        const { rows: srcJob } = await this.pool.query(
+          `SELECT model, "rootJobId" FROM genshape3d_jobs WHERE id=$1`, [job.sourceJobId],
+        );
+        if (srcJob[0]?.model === 'refine' && srcJob[0].rootJobId) {
+          const { rows: orig } = await this.pool.query(
+            `SELECT "resultUrl" FROM genshape3d_jobs
+             WHERE "rootJobId"=$1 AND version=1 AND "resultUrl" <> '' LIMIT 1`,
+            [srcJob[0].rootJobId],
+          );
+          if (orig[0]?.resultUrl) {
+            await this.downloadFromR2(orig[0].resultUrl, tmpDir, 'bake_source');
+            console.log(`[TextureWorker] Downloaded lineage v1 as normal-bake source.`);
+          }
+        }
+      } catch (e) {
+        console.warn(`[TextureWorker] bake-source fetch skipped: ${e.message}`);
+      }
+
       // ── Download reference image ───────────────────────────────────────
       let imagePath = null;
       if (job.sourceImageUrl) {
@@ -1068,9 +1435,11 @@ else:
             env: { ...process.env },
             stdio: ['ignore', 'pipe', 'pipe'],
           });
+          const watchdog = this.attachWatchdog(proc, 'Hunyuan3DPaint');
           let stdout = '';
           let stderr = '';
           proc.stdout.on('data', data => {
+            watchdog.touch();
             const text = data.toString();
             stdout += text;
             text.split('\n').filter(Boolean).forEach(line => {
@@ -1085,12 +1454,17 @@ else:
             });
           });
           proc.stderr.on('data', data => {
+            watchdog.touch();
             stderr += data.toString();
             data.toString().split('\n').filter(Boolean).forEach(l =>
               console.error(`[Hunyuan3DPaint ERR] ${l}`),
             );
           });
           proc.on('close', code => {
+            watchdog.stop();
+            if (watchdog.killedWhy()) {
+              return reject(new Error(`Paint killed by watchdog: ${watchdog.killedWhy()}`));
+            }
             if (code !== 0) {
               return reject(new Error(`Paint process exited with code ${code}: ${stderr.slice(-500)}`));
             }
@@ -1150,15 +1524,348 @@ else:
     }
   }
 
-  async uploadToR2(filePath) {
+  /**
+   * Process a mesh refine job from genshape3d_refine_jobs. Downloads the
+   * source GLB, runs refine.py (weld / floaters / holes / normals /
+   * optional decimate) in the hunyuan3d-2-1 venv, uploads the result, and
+   * inserts a NEW genshape3d_jobs row so the clean mesh appears as a
+   * normal derivative asset. The source job is never touched.
+   */
+  async processRefineJob(job) {
+    this.refineActive = true;
+    try {
+      await this._processRefineJobInner(job);
+    } finally {
+      this.refineActive = false;
+    }
+  }
+
+  async _processRefineJobInner(job) {
+    this.activeCount++;
+    let tmpDir;
+    try {
+      const claim = await this.pool.query(
+        `UPDATE genshape3d_refine_jobs
+            SET status='processing', "startedAt"=NOW(), "assignedWorkerId"=$1,
+                "updatedAt"=NOW(), "progressPct"=0, "progressPhase"='Preparing...'
+          WHERE id=$2 AND status='pending'`,
+        [this.workerId, job.id],
+      );
+      if (claim.rowCount === 0) {
+        console.log(`[RefineWorker] Job ${job.id.slice(0, 8)} already claimed, skipping.`);
+        this.activeCount--;
+        return;
+      }
+
+      const updateProgress = async (pct, phase) => {
+        try {
+          await this.pool.query(
+            `UPDATE genshape3d_refine_jobs
+                SET "progressPct"=$1, "progressPhase"=$2, "updatedAt"=NOW() WHERE id=$3`,
+            [pct, phase, job.id],
+          );
+        } catch { /* non-fatal */ }
+      };
+
+      tmpDir = path.join(os.tmpdir(), `genshape3d-refine-${job.id}`);
+      fs.mkdirSync(tmpDir, { recursive: true });
+
+      await updateProgress(2, 'Downloading mesh...');
+      const meshPath = await this.downloadFromR2(job.sourceModelUrl, tmpDir, 'source_mesh');
+
+      const ops = typeof job.operations === 'string' ? JSON.parse(job.operations) : (job.operations || {});
+      const runnersDir = process.env.RUNNERS_DIR || 'C:/projects/genshape-worker-3090/runners';
+      const runnerDir = path.join(runnersDir, 'hunyuan3d-2-1');
+      const pythonCmd = path.join(runnerDir, '.venv', 'Scripts', 'python.exe');
+      const outputPath = path.join(tmpDir, 'refined.glb');
+
+      const args = [
+        path.join(runnerDir, 'refine.py'),
+        '--input', meshPath,
+        '--output', outputPath,
+        '--target-faces', String(ops.targetFaces || 0),
+        '--keep-frac', String(ops.keepFrac || 0.02),
+        '--smooth', String(ops.smooth || 0),
+      ];
+      if (ops.fillHoles === false) args.push('--no-fill-holes');
+      if (ops.rebuild === true) args.push('--rebuild');
+      if (Array.isArray(ops.partRle) && ops.partRle.length) {
+        // Part-scoped cleanup: remesh only the selected part's faces. The
+        // source mesh MUST be the canonical segmented GLB the rle refers to.
+        const pf = path.join(tmpDir, 'part_sel.json');
+        fs.writeFileSync(pf, JSON.stringify({ rle: ops.partRle, part: ops.partIndex || 0 }));
+        args.push('--part-faces', pf);
+      }
+
+      console.log(`[RefineWorker] Spawning: ${pythonCmd} ${args.slice(1).join(' ')}`);
+      let stats = {};
+      await new Promise((resolve, reject) => {
+        const proc = spawn(pythonCmd, args, {
+          cwd: runnerDir,
+          env: { ...process.env },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        const watchdog = this.attachWatchdog(proc, 'Refine');
+        let stdout = '', stderr = '';
+        proc.stdout.on('data', data => {
+          watchdog.touch();
+          const text = data.toString();
+          stdout += text;
+          text.split('\n').filter(Boolean).forEach(line => {
+            if (line.startsWith('PROGRESS:')) {
+              try {
+                const p = JSON.parse(line.slice(9));
+                updateProgress(p.pct || 0, p.detail || p.phase || '').catch(() => {});
+              } catch { /* ignore */ }
+            } else if (!line.startsWith('RESULT:')) {
+              console.log(`[Refine] ${line}`);
+            }
+          });
+        });
+        proc.stderr.on('data', data => {
+          watchdog.touch();
+          stderr += data.toString();
+        });
+        proc.on('close', code => {
+          watchdog.stop();
+          if (watchdog.killedWhy()) return reject(new Error(`Refine killed by watchdog: ${watchdog.killedWhy()}`));
+          if (code !== 0) return reject(new Error(`Refine exited ${code}: ${stderr.slice(-400)}`));
+          const resultLine = stdout.split('\n').find(l => l.startsWith('RESULT:'));
+          if (resultLine) {
+            try { stats = JSON.parse(resultLine.slice(7)); } catch { /* keep {} */ }
+          }
+          if (!fs.existsSync(outputPath)) return reject(new Error('Refine produced no output file'));
+          resolve();
+        });
+        proc.on('error', err => reject(new Error(`Failed to spawn refine: ${err.message}`)));
+      });
+
+      await updateProgress(95, 'Uploading refined mesh...');
+      const resultUrl = await this.uploadToR2(outputPath);
+
+      // Insert the derivative as a new VERSION of the source's lineage —
+      // same asset identity (rootJobId), same name, incremented version.
+      // model 'refine' marks provenance and keeps it out of GPU routing.
+      const { rows: srcRows } = await this.pool.query(
+        `SELECT name, "imageUrl", "userEmail", "rootJobId" FROM genshape3d_jobs WHERE id=$1`,
+        [job.sourceJobId],
+      );
+      const src = srcRows[0] || {};
+      const rootJobId = src.rootJobId || job.sourceJobId;
+      const { rows: verRows } = await this.pool.query(
+        `SELECT COALESCE(MAX(version), 1) + 1 AS next FROM genshape3d_jobs WHERE "rootJobId" = $1`,
+        [rootJobId],
+      );
+      const nextVersion = verRows[0]?.next || 2;
+      const ops2 = typeof job.operations === 'string' ? JSON.parse(job.operations) : (job.operations || {});
+      const faceNote = stats.faces_out ? ` ${Math.round(stats.faces_out / 1000)}k` : '';
+      const versionLabel = Array.isArray(ops2.partRle) && ops2.partRle.length
+        ? 'part cleanup'
+        : `${ops2.rebuild ? 'rebuilt' : 'refined'}${faceNote}`;
+      const newJobId = crypto.randomUUID();
+      const nowIso = new Date().toISOString();
+      await this.pool.query(
+        `INSERT INTO genshape3d_jobs
+           (id, "userEmail", "imageUrl", name, prompt, style, status, "resultUrl",
+            "createdAt", "updatedAt", "startedAt", "completedAt",
+            model, "assignedWorkerId", "doTexture", "progressPct", "progressPhase",
+            "rootJobId", version, "versionLabel")
+         VALUES ($1, $2, $3, $4, $5, 'Realistic', 'done', $6, $7, $7, NOW(), NOW(),
+                 'refine', $8, false, 100, 'done', $9, $10, $11)`,
+        [
+          newJobId,
+          job.userEmail,
+          src.imageUrl || '',
+          (src.name || 'Asset').slice(0, 60),
+          `Refined mesh (weld, floaters, holes, normals${(stats.faces_out && stats.faces_in && stats.faces_out < stats.faces_in) ? `, ${stats.faces_in}→${stats.faces_out} faces` : ''})`,
+          resultUrl,
+          nowIso,
+          this.workerId,
+          rootJobId,
+          nextVersion,
+          versionLabel,
+        ],
+      );
+
+      await this.pool.query(
+        `UPDATE genshape3d_refine_jobs
+            SET status='done', "resultUrl"=$1, "resultJobId"=$2, stats=$3,
+                "progressPct"=100, "progressPhase"='Refine complete!',
+                "completedAt"=NOW(), "updatedAt"=NOW()
+          WHERE id=$4`,
+        [resultUrl, newJobId, JSON.stringify(stats), job.id],
+      );
+      console.log(`[RefineWorker] Job ${job.id.slice(0, 8)} complete -> asset ${newJobId.slice(0, 8)} (${stats.faces_in}->${stats.faces_out} faces, ${stats.floaters_removed} floaters removed)`);
+
+    } catch (err) {
+      console.error(`[RefineWorker] Job ${job.id} failed:`, err.stack || err.message);
+      try {
+        await this.pool.query(
+          `UPDATE genshape3d_refine_jobs
+              SET status='failed', "completedAt"=NOW(), "progressPhase"='failed',
+                  "errorMessage"=$1, "updatedAt"=NOW()
+            WHERE id=$2`,
+          [(err.message || '').slice(0, 4000), job.id],
+        );
+      } catch { /* non-fatal */ }
+    } finally {
+      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+      this.activeCount--;
+      this.processing = this.activeCount > 0;
+      this.emit('stateChanged');
+    }
+  }
+
+  /**
+   * Process a part-segmentation job from genshape3d_segment_jobs.
+   * Downloads the source GLB, runs the PartField runner (learned per-face
+   * feature field + hierarchical clustering), uploads the canonical
+   * segmented GLB + labels JSON, and marks the job done. The client must
+   * render the uploaded meshUrl — its face order is the label space.
+   */
+  async processSegmentJob(job) {
+    this.activeCount++;
+    let tmpDir;
+    try {
+      const claim = await this.pool.query(
+        `UPDATE genshape3d_segment_jobs
+            SET status='processing', "startedAt"=NOW(), "assignedWorkerId"=$1,
+                "updatedAt"=NOW(), "progressPct"=0, "progressPhase"='Preparing...'
+          WHERE id=$2 AND status='pending'`,
+        [this.workerId, job.id],
+      );
+      if (claim.rowCount === 0) {
+        console.log(`[SegmentWorker] Job ${job.id.slice(0, 8)} already claimed, skipping.`);
+        this.activeCount--;
+        return;
+      }
+
+      const updateProgress = async (pct, phase) => {
+        try {
+          await this.pool.query(
+            `UPDATE genshape3d_segment_jobs
+                SET "progressPct"=$1, "progressPhase"=$2, "updatedAt"=NOW() WHERE id=$3`,
+            [pct, phase, job.id],
+          );
+        } catch { /* non-fatal */ }
+      };
+
+      tmpDir = path.join(os.tmpdir(), `genshape3d-seg-${job.id}`);
+      fs.mkdirSync(tmpDir, { recursive: true });
+
+      await updateProgress(2, 'Downloading mesh...');
+      const meshPath = await this.downloadFromR2(job.sourceModelUrl, tmpDir, 'source_mesh');
+
+      const runnersDir = process.env.RUNNERS_DIR || 'C:/projects/genshape-worker-3090/runners';
+      const runnerDir = path.join(runnersDir, 'partfield');
+      const pythonCmd = path.join(runnerDir, '.venv', 'Scripts', 'python.exe');
+      const outDir = path.join(tmpDir, 'out');
+
+      const args = [
+        path.join(runnerDir, 'run.py'),
+        '--mesh', meshPath,
+        '--output-dir', outDir,
+      ];
+
+      console.log(`[SegmentWorker] Spawning: ${pythonCmd} ${args.slice(1).join(' ')}`);
+      const stopGpu = this.startGpuSampler();
+      let result = {};
+      try {
+        await new Promise((resolve, reject) => {
+          const proc = spawn(pythonCmd, args, {
+            cwd: runnerDir,
+            env: { ...process.env },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          const watchdog = this.attachWatchdog(proc, 'PartField');
+          let stdout = '', stderr = '';
+          proc.stdout.on('data', data => {
+            watchdog.touch();
+            const text = data.toString();
+            stdout += text;
+            text.split('\n').filter(Boolean).forEach(line => {
+              if (line.startsWith('PROGRESS:')) {
+                try {
+                  const p = JSON.parse(line.slice(9));
+                  updateProgress(p.pct || 0, p.detail || p.phase || '').catch(() => {});
+                } catch { /* ignore */ }
+              } else if (!line.startsWith('RESULT:')) {
+                console.log(`[PartField] ${line}`);
+              }
+            });
+          });
+          proc.stderr.on('data', data => {
+            watchdog.touch();
+            stderr += data.toString();
+          });
+          proc.on('close', code => {
+            watchdog.stop();
+            if (watchdog.killedWhy()) return reject(new Error(`PartField killed by watchdog: ${watchdog.killedWhy()}`));
+            const resultLine = stdout.split('\n').find(l => l.startsWith('RESULT:'));
+            if (resultLine) {
+              try { result = JSON.parse(resultLine.slice(7)); } catch { /* keep {} */ }
+            }
+            if (result.status === 'error') return reject(new Error(`PartField: ${result.error}`));
+            if (code !== 0) return reject(new Error(`PartField exited ${code}: ${stderr.slice(-400)}`));
+            if (!result.output_glb || !fs.existsSync(result.output_glb)) {
+              return reject(new Error('PartField produced no segmented GLB'));
+            }
+            if (!result.output_labels || !fs.existsSync(result.output_labels)) {
+              return reject(new Error('PartField produced no labels JSON'));
+            }
+            resolve();
+          });
+          proc.on('error', err => reject(new Error(`Failed to spawn PartField: ${err.message}`)));
+        });
+      } finally {
+        await stopGpu();
+      }
+
+      await updateProgress(96, 'Uploading segmentation...');
+      const meshUrl = await this.uploadToR2(result.output_glb);
+      const labelsUrl = await this.uploadToR2(result.output_labels, {
+        ext: '.json', contentType: 'application/json',
+      });
+
+      await this.pool.query(
+        `UPDATE genshape3d_segment_jobs
+            SET status='done', "meshUrl"=$1, "labelsUrl"=$2, "faceCount"=$3,
+                "completedAt"=NOW(), "progressPct"=100,
+                "progressPhase"='Segmentation complete!', "updatedAt"=NOW()
+          WHERE id=$4`,
+        [meshUrl, labelsUrl, result.face_count || 0, job.id],
+      );
+      console.log(`[SegmentWorker] Job ${job.id.slice(0, 8)} complete ✓ (${result.face_count} faces, ${result.levels} levels)`);
+
+    } catch (err) {
+      console.error(`[SegmentWorker] Job ${job.id} failed:`, err.stack || err.message);
+      try {
+        await this.pool.query(
+          `UPDATE genshape3d_segment_jobs
+              SET status='failed', "completedAt"=NOW(), "progressPhase"='failed',
+                  "errorMessage"=$1, "updatedAt"=NOW()
+            WHERE id=$2`,
+          [(err.message || '').slice(0, 4000), job.id],
+        );
+      } catch { /* non-fatal */ }
+    } finally {
+      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+      this.activeCount--;
+      this.processing = this.activeCount > 0;
+      this.emit('stateChanged');
+    }
+  }
+
+  async uploadToR2(filePath, opts = {}) {
     const buffer = fs.readFileSync(filePath);
-    const key = `outputs/${Date.now()}-${crypto.randomUUID()}.glb`;
+    const ext = opts.ext || '.glb';
+    const key = `outputs/${Date.now()}-${crypto.randomUUID()}${ext}`;
 
     await this.s3.send(new PutObjectCommand({
       Bucket: this.config.r2Bucket,
       Key: key,
       Body: buffer,
-      ContentType: 'model/gltf-binary',
+      ContentType: opts.contentType || 'model/gltf-binary',
     }));
 
     const publicUrl = this.config.r2PublicUrl || `${this.config.r2Endpoint}/${this.config.r2Bucket}`;
