@@ -1,5 +1,5 @@
 const { Pool } = require('pg');
-const p = new Pool({ connectionString: 'postgresql://genshape3d:genshape3d@192.168.20.16:5432/genshape3d', ssl: false });
+const p = new Pool({ connectionString: 'postgresql://genshape3d:genshape3d@192.168.20.23:5432/genshape3d', ssl: false });
 (async () => {
   const r = await p.query(`
     SELECT status, model, "preferredWorkerId", "assignedWorkerId", COUNT(*)::int n

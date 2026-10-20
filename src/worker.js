@@ -26,7 +26,7 @@ class Worker extends EventEmitter {
     this.config = config;
     this.workerId = WORKER_ID;
     // Postgres runs plain TCP on the private LAN (no SSL) — both on the i7
-    // itself (127.0.0.1) and for LAN boxes (192.168.20.16). The trust
+    // itself (127.0.0.1) and for LAN boxes (192.168.20.23). The trust
     // boundary is the LAN, not TLS. Opt back into SSL only if DB_SSL=1.
     const useSsl = process.env.DB_SSL === '1';
     this._makePool = () => {

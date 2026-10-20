@@ -1,5 +1,5 @@
 const { Pool } = require('pg');
-const p = new Pool({ connectionString: 'postgresql://genshape3d:genshape3d@192.168.20.16:5432/genshape3d', ssl: false });
+const p = new Pool({ connectionString: 'postgresql://genshape3d:genshape3d@192.168.20.23:5432/genshape3d', ssl: false });
 (async () => {
   // 1. The hung textured job on the i7 → back to pending, rerouted to 3090.
   const hung = await p.query(`
