@@ -212,6 +212,7 @@ def run_texture_only(args) -> int:
         mesh_path=str(shape_obj),
         image_path=str(img_path),
         output_mesh_path=str(textured_obj),
+        use_remesh=False,   # the mesh we are given is already final: keep every triangle, a remesh reopens closed holes
     )
     paint_time = time.time() - t1
     log(f"PBR paint done in {paint_time:.1f}s")
