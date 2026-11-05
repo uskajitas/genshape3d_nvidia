@@ -2,6 +2,7 @@ const { EventEmitter } = require('events');
 const { readReport, readHistory } = require('./report');
 const { GpuRoom } = require('./gpuRoom');
 const { CardPolicy } = require('./cardPolicy');
+const { UgpuLink } = require('./ugpuLink');
 const { Pool } = require('pg');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { spawn } = require('child_process');
@@ -68,7 +69,8 @@ class Worker extends EventEmitter {
     this.failedJobs = [];
     this.cancelledJobs = [];
     this.card = new CardPolicy(() => this.activeCount > 0);
-    this.gpuRoom = new GpuRoom(this.card);
+    this.ugpu = new UgpuLink(this);
+    this.gpuRoom = new GpuRoom(this.card, this.ugpu);
   }
 
   getState() {
@@ -530,7 +532,7 @@ class Worker extends EventEmitter {
             || (isHeavy(nextJob) && (this.processingJobs.length > 0 || this.refineActive));
           if (blocked) {
             console.log(`[Worker] holding ${nextJob.id.slice(0,8)} — GPU exclusivity (heavy job running or queued job is heavy).`);
-          } else if (this.activeCount > 0 || await this.gpuRoom.ready(nextJob.id, isHeavy(nextJob))) {
+          } else if (this.activeCount > 0 || await this.gpuRoom.ready(nextJob.id, isHeavy(nextJob), { title: nextJob.name, model: nextJob.model })) {
             this.processJob(nextJob);
           }
         }
@@ -547,7 +549,7 @@ class Worker extends EventEmitter {
              ORDER BY "createdAt" ASC
              LIMIT 1`,
           );
-          if (texPending.length > 0 && await this.gpuRoom.ready(texPending[0].id, true)) {
+          if (texPending.length > 0 && await this.gpuRoom.ready(texPending[0].id, true, { title: `Paint ${texPending[0].name || texPending[0].id.slice(0, 8)}` })) {
             console.log(`[Worker] Picking up texture job ${texPending[0].id.slice(0, 8)}`);
             this.processTextureJob(texPending[0]);
           }
@@ -587,7 +589,7 @@ class Worker extends EventEmitter {
              ORDER BY "createdAt" ASC
              LIMIT 1`,
           );
-          if (segPending.length > 0 && await this.gpuRoom.ready(segPending[0].id, false)) {
+          if (segPending.length > 0 && await this.gpuRoom.ready(segPending[0].id, false, { title: `Parts ${segPending[0].id.slice(0, 8)}` })) {
             console.log(`[Worker] Picking up segment job ${segPending[0].id.slice(0, 8)}`);
             this.processSegmentJob(segPending[0]);
           }
@@ -614,6 +616,7 @@ class Worker extends EventEmitter {
    * Write progress to the database so the web frontend can read it.
    */
   async updateProgress(jobId, progress) {
+    this.ugpu.progress(jobId, progress);
     try {
       await this.pool.query(
         `UPDATE genshape3d_jobs SET "progressPct" = $1, "progressPhase" = $2, "progressStep" = $3, "progressTotal" = $4, "updatedAt" = NOW() WHERE id = $5`,
@@ -863,6 +866,7 @@ class Worker extends EventEmitter {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
       this.activeCount--;
+      this.ugpu.end(job.id, 'genshape3d_jobs');
       this.processing = this.activeCount > 0;
       this.currentJob = null;
       this.emit('stateChanged');
@@ -1568,6 +1572,7 @@ else:
     } finally {
       if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
       this.activeCount--;
+      this.ugpu.end(job.id, 'genshape3d_texture_jobs');
       this.processing = this.activeCount > 0;
       this.emit('stateChanged');
     }
@@ -1900,6 +1905,7 @@ else:
     } finally {
       if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
       this.activeCount--;
+      this.ugpu.end(job.id, 'genshape3d_segment_jobs');
       this.processing = this.activeCount > 0;
       this.emit('stateChanged');
     }

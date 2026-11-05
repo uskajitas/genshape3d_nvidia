@@ -43,8 +43,9 @@ async function neighbourLoading() {
 }
 
 class GpuRoom {
-  constructor(card) {
+  constructor(card, ugpu) {
     this.card = card;
+    this.ugpu = ugpu;
     this.held = new Map();      // job id -> why it is waiting, shown in the window
     this.since = new Map();     // job id -> when it started waiting
     this.askedAt = 0;
@@ -53,7 +54,10 @@ class GpuRoom {
   release(id) { this.held.delete(id); this.since.delete(id); }
 
   /** True when the job may start now. */
-  async ready(id, heavy) {
+  async ready(id, heavy, info) {
+    const turn = await this.ugpu.ask(id, heavy, info);
+    if (turn === 'go') { this.release(id); return true; }
+    if (turn === 'wait') { this.held.set(id, 'In the queue for the RTX 3090'); return false; }
     const need = heavy ? NEED_HEAVY_GB : NEED_LIGHT_GB;
     if (this.card.holder() || this.card.waiting().length) {
       this.held.set(id, 'Next, after the picture on the RTX 3090');
