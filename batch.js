@@ -50,13 +50,20 @@ async function status(name) {
 }
 
 async function paint(prompt, gen, size, seed) {
-  const r = await fetch(IMAGE_GEN + '/generate', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ prompt, model: gen, width: size, height: size, seed }),
-    signal: AbortSignal.timeout(20 * 60_000),
-  });
-  const j = await r.json();
+  // The card is queued by ugpu: "busy" means this picture is waiting its turn. Asking again keeps the place.
+  const giveUp = Date.now() + 60 * 60_000;
+  let r, j;
+  for (;;) {
+    r = await fetch(IMAGE_GEN + '/generate', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt, model: gen, width: size, height: size, seed }),
+      signal: AbortSignal.timeout(20 * 60_000),
+    });
+    j = await r.json();
+    if (r.status !== 503 || !j.busy || Date.now() > giveUp) break;
+    await new Promise((done) => setTimeout(done, 3000));
+  }
   if (!r.ok || !j.image) throw new Error(`image generator: ${r.status} ${JSON.stringify(j).slice(0, 200)}`);
   return { buf: Buffer.from(j.image.split(',')[1], 'base64'), ms: j.ms, model: j.model };
 }
