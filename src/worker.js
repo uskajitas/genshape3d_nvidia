@@ -1,4 +1,6 @@
 const { EventEmitter } = require('events');
+const { readReport, readHistory } = require('./report');
+const { GpuRoom } = require('./gpuRoom');
 const { Pool } = require('pg');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { spawn } = require('child_process');
@@ -64,6 +66,7 @@ class Worker extends EventEmitter {
     this.completedJobs = [];
     this.failedJobs = [];
     this.cancelledJobs = [];
+    this.gpuRoom = new GpuRoom();
   }
 
   getState() {
@@ -79,11 +82,43 @@ class Worker extends EventEmitter {
       isProcessing: this.processing,
       maxConcurrent: this.maxConcurrent,
       activeCount: this.activeCount,
+      // What the window shows. It says itself when it is old or the database cannot be reached.
+      report: this.report || null,
+      reportError: this.reportError || null,
+      pollError: this.pollError || null,
     };
   }
 
+  /** The window's numbers, every few seconds, whatever the poll loop is doing. */
+  async refreshReport() {
+    if (this._reporting) return;
+    this._reporting = true;
+    let timer;
+    try {
+      const read = readReport(this.pool, {
+        id: this.workerId,
+        models: (this.config.models || ['hunyuan3d']).map((m) => m.toLowerCase()),
+        held: this.gpuRoom.held,
+        activeCount: this.activeCount,
+      });
+      read.catch(() => {});
+      this.report = await Promise.race([read, new Promise((_, no) => { timer = setTimeout(() => no(new Error('the database did not answer in 15 seconds')), 15000); })]);
+      this.reportError = null;
+    } catch (err) {
+      this.reportError = { message: err.message, at: Date.now() };
+    } finally {
+      clearTimeout(timer);
+      this._reporting = false;
+      this.emit('stateChanged');
+    }
+  }
+
+  history(from, to) { return readHistory(this.pool, this.workerId, from, to); }
+
   async start() {
     console.log('[Worker] Starting poll loop...');
+    this.refreshReport();
+    this.reportTimer = setInterval(() => this.refreshReport(), 5000);
     await this.ensureTable();
     // On startup, mark any "processing" rows still tagged to THIS worker
     // as failed — they're orphans from a previous run that got SIGKILL'd.
@@ -314,6 +349,7 @@ class Worker extends EventEmitter {
         [models, this.workerId]
       );
       this._pendingForClaim = pending;
+      this.pendingJobs = pending;
 
       // ── Stale-pending takeover ─────────────────────────────────
       // Guarantee: no job sits pending forever just because it was routed to
@@ -343,8 +379,6 @@ class Worker extends EventEmitter {
           this._pendingForClaim.push(...stale);
         }
       }
-
-      this.pendingJobs = [];
 
       // ── Processing — only this machine's ──────────────────────
       const { rows: processing } = await this.pool.query(
@@ -489,7 +523,7 @@ class Worker extends EventEmitter {
             || (isHeavy(nextJob) && (this.processingJobs.length > 0 || this.refineActive));
           if (blocked) {
             console.log(`[Worker] holding ${nextJob.id.slice(0,8)} — GPU exclusivity (heavy job running or queued job is heavy).`);
-          } else {
+          } else if (this.activeCount > 0 || await this.gpuRoom.ready(nextJob.id, isHeavy(nextJob))) {
             this.processJob(nextJob);
           }
         }
@@ -506,7 +540,7 @@ class Worker extends EventEmitter {
              ORDER BY "createdAt" ASC
              LIMIT 1`,
           );
-          if (texPending.length > 0) {
+          if (texPending.length > 0 && await this.gpuRoom.ready(texPending[0].id, true)) {
             console.log(`[Worker] Picking up texture job ${texPending[0].id.slice(0, 8)}`);
             this.processTextureJob(texPending[0]);
           }
@@ -546,7 +580,7 @@ class Worker extends EventEmitter {
              ORDER BY "createdAt" ASC
              LIMIT 1`,
           );
-          if (segPending.length > 0) {
+          if (segPending.length > 0 && await this.gpuRoom.ready(segPending[0].id, false)) {
             console.log(`[Worker] Picking up segment job ${segPending[0].id.slice(0, 8)}`);
             this.processSegmentJob(segPending[0]);
           }
@@ -554,7 +588,9 @@ class Worker extends EventEmitter {
           console.warn(`[Worker] Segment job poll failed (non-fatal): ${segErr.message}`);
         }
       }
+      this.pollError = null;
     } catch (err) {
+      this.pollError = { message: err.message, at: Date.now() };
       console.error('[Worker] Poll error:', err.message);
       console.error(err.stack);
       // Connection-class errors poison the pool's clients — recreate it now

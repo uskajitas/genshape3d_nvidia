@@ -5,593 +5,319 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>GenShape3D Worker</title>
   <style>
+    :root {
+      --ground: #1a1a2e; --panel: #16213e; --line: #0f3460; --text: #e0e0e0; --muted: #8a9bb0;
+      --accent: #00d2ff; --good: #4caf50; --bad: #ff6b6b; --warn: #ffb74d;
+    }
     * { margin: 0; padding: 0; box-sizing: border-box; }
-
+    html, body { height: 100%; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: #1a1a2e;
-      color: #e0e0e0;
-      overflow-y: auto;
-      height: 100vh;
+      font: 13px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--ground); color: var(--text);
+      display: flex; flex-direction: column; overflow: hidden;
     }
+    .top { background: var(--panel); border-bottom: 1px solid var(--line); padding: 12px 16px; flex: none; }
+    .top-row { display: flex; align-items: center; gap: 10px; }
+    h1 { font-size: 15px; font-weight: 600; color: var(--accent); }
+    .gpu { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+    .dot.ok { background: var(--good); } .dot.busy { background: var(--warn); } .dot.down { background: var(--bad); }
+    .status { height: 38px; margin-top: 6px; overflow: hidden; font-size: 13px; }
+    .status.down { color: var(--bad); font-weight: 600; }
 
-    .header {
-      background: #16213e;
-      padding: 16px 20px;
-      border-bottom: 1px solid #0f3460;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      position: sticky;
-      top: 0;
-      z-index: 10;
+    .scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 0 16px 16px; }
+    h2 {
+      font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+      margin: 14px 0 6px; display: flex; gap: 8px; align-items: baseline;
     }
+    h2 b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .none { color: var(--muted); padding: 10px 0; min-height: 40px; }
+    ul { list-style: none; }
+    .job { display: flex; gap: 10px; padding: 8px 0; border-top: 1px solid var(--line); }
+    .job:first-child { border-top: 0; }
+    .thumb { width: 44px; height: 44px; border-radius: 6px; object-fit: cover; background: var(--line); flex: none; }
+    .body { flex: 1; min-width: 0; }
+    .name { font-weight: 600; overflow-wrap: anywhere; }
+    .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .why { font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
+    .why.bad { color: var(--bad); } .why.warn { color: var(--warn); }
+    .bar { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; margin-top: 5px; }
+    .bar i { display: block; height: 100%; width: 100%; background: var(--accent); transform-origin: left; transition: transform .4s; }
+    details { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    summary { cursor: pointer; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.4 Consolas, monospace; margin-top: 4px; user-select: text; }
+    a { color: var(--accent); }
+    .side { flex: none; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+    .pill { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 10px; background: var(--line); }
+    .pill.done { color: var(--good); } .pill.failed { color: var(--bad); } .pill.cancelled { color: var(--muted); }
+    button { font: inherit; color: var(--text); background: var(--line); border: 0; border-radius: 5px; padding: 3px 10px; cursor: pointer; }
+    button:hover { filter: brightness(1.25); }
+    button:focus-visible, tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .switch { display: inline-flex; gap: 2px; margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400; }
+    .switch button { background: none; color: var(--muted); }
+    .switch button.on { background: var(--line); color: var(--text); }
 
-    .header h1 {
-      font-size: 16px;
-      font-weight: 600;
-      color: #00d2ff;
-    }
-
-    .status-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: #4caf50;
-      animation: pulse 2s infinite;
-    }
-
-    .status-dot.idle { background: #4caf50; }
-    .status-dot.busy { background: #ff9800; animation: pulse 1s infinite; }
-
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.5; }
-    }
-
-    .section {
-      padding: 12px 20px;
-    }
-
-    .section-title {
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      color: #888;
-      margin-bottom: 8px;
-      font-weight: 600;
-    }
-
-    .current-job {
-      background: #16213e;
-      border: 1px solid #0f3460;
-      border-radius: 8px;
-      padding: 14px;
-      margin-bottom: 8px;
-    }
-
-    .current-job .label {
-      font-size: 11px;
-      color: #ff9800;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 6px;
-    }
-
-    .current-job .id {
-      font-family: 'Consolas', monospace;
-      font-size: 13px;
-      color: #00d2ff;
-    }
-
-    .current-job .times {
-      margin-top: 6px;
-      font-size: 11px;
-      color: #aaa;
-    }
-
-    .current-job .times span {
-      color: #ff9800;
-      font-weight: 500;
-    }
-
-    .progress-detail {
-      font-size: 12px;
-      color: #00d2ff;
-      font-weight: 500;
-      display: block;
-      margin-top: 6px;
-    }
-
-    .current-job .progress {
-      margin-top: 8px;
-      height: 4px;
-      background: #0f3460;
-      border-radius: 2px;
-      overflow: hidden;
-    }
-
-    .current-job .progress-bar {
-      height: 100%;
-      background: linear-gradient(90deg, #00d2ff, #ff9800);
-      width: 60%;
-      animation: progress-anim 2s ease-in-out infinite;
-    }
-
-    @keyframes progress-anim {
-      0% { width: 20%; }
-      50% { width: 80%; }
-      100% { width: 20%; }
-    }
-
-    .job-list {
-      list-style: none;
-    }
-
-    .job-item {
-      background: #16213e;
-      border: 1px solid #0f3460;
-      border-radius: 6px;
-      padding: 10px 14px;
-      margin-bottom: 6px;
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-    }
-
-    .job-item .job-id {
-      font-family: 'Consolas', monospace;
-      font-size: 12px;
-      color: #ccc;
-    }
-
-    .job-item .job-time {
-      font-size: 11px;
-      color: #666;
-      margin-top: 2px;
-    }
-
-    .job-item .job-duration {
-      font-size: 10px;
-      color: #888;
-      margin-top: 2px;
-    }
-
-    .job-right {
-      display: flex;
-      flex-direction: column;
-      align-items: flex-end;
-      gap: 6px;
-      flex-shrink: 0;
-    }
-
-    .badge {
-      font-size: 10px;
-      padding: 2px 8px;
-      border-radius: 10px;
-      font-weight: 600;
-      text-transform: uppercase;
-      flex-shrink: 0;
-    }
-
-    .badge.pending { background: #1a237e; color: #7c8dff; }
-    .badge.processing { background: #4a2800; color: #ff9800; }
-    .badge.done { background: #1b3a1b; color: #4caf50; }
-    .badge.failed { background: #3a1b1b; color: #f44336; }
-    .badge.cancelled { background: #3a3a1b; color: #aaa; }
-
-    /* Model tag — shown on every job so the UI is consistent across
-       1080 + 3090 and the user can see at-a-glance which model a job
-       was/is running. */
-    .model-tag {
-      font-size: 10px;
-      background: #0f3460;
-      color: #00d2ff;
-      padding: 2px 7px;
-      border-radius: 3px;
-      margin-left: 6px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      vertical-align: middle;
-    }
-    .model-tag.hunyuan3d { background: #1a3a5c; color: #00d2ff; }
-    .model-tag.triposr   { background: #3a1a5c; color: #c87cff; }
-    .model-tag.sf3d      { background: #5c3a1a; color: #ffae66; }
-    .model-tag.hi3dgen   { background: #1a5c3a; color: #66ffae; }
-
-    .btn-cancel {
-      font-size: 10px;
-      padding: 3px 10px;
-      border-radius: 4px;
-      border: 1px solid #f44336;
-      background: transparent;
-      color: #f44336;
-      cursor: pointer;
-      font-weight: 600;
-      transition: all 0.15s;
-    }
-
-    .btn-cancel:hover {
-      background: #f44336;
-      color: #fff;
-    }
-
-    .btn-cancel:active {
-      transform: scale(0.95);
-    }
-
-    .current-job .btn-cancel {
-      margin-top: 10px;
-      padding: 5px 16px;
-      font-size: 11px;
-    }
-
-    .empty {
-      text-align: center;
-      padding: 20px;
-      color: #555;
-      font-size: 13px;
-    }
-
-    .stats {
-      display: flex;
-      gap: 12px;
-      padding: 8px 20px 4px;
-    }
-
-    .stat-box {
-      flex: 1;
-      background: #16213e;
-      border: 1px solid #0f3460;
-      border-radius: 6px;
-      padding: 10px;
-      text-align: center;
-    }
-
-    .stat-box .num {
-      font-size: 22px;
-      font-weight: 700;
-      color: #00d2ff;
-    }
-
-    .stat-box .lbl {
-      font-size: 10px;
-      color: #888;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-
-    .stat-box.active .num { color: #ff9800; }
+    .periods { max-height: 196px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th { position: sticky; top: 0; background: var(--panel); color: var(--muted); font-size: 11px; font-weight: 600; text-align: right; padding: 4px 10px; }
+    td { text-align: right; padding: 4px 10px; border-top: 1px solid var(--line); }
+    th:first-child, td:first-child { text-align: left; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: var(--panel); }
+    tbody tr.on { background: var(--line); }
+    td.failed { color: var(--bad); font-weight: 700; } td.done { color: var(--good); }
+    td.zero { color: var(--muted); font-weight: 400; }
   </style>
 </head>
 <body>
-  <div class="header">
-    <div class="status-dot" id="statusDot"></div>
-    <h1 id="workerHeader">GenShape3D Worker</h1>
-  </div>
-
-  <div class="stats">
-    <div class="stat-box">
-      <div class="num" id="pendingCount">0</div>
-      <div class="lbl">Pending</div>
+  <div class="top">
+    <div class="top-row">
+      <div class="dot" id="dot"></div>
+      <h1 id="title">GenShape3D Worker</h1>
+      <div class="gpu" id="gpu"></div>
     </div>
-    <div class="stat-box active">
-      <div class="num" id="processingCount">0</div>
-      <div class="lbl">Processing</div>
-    </div>
-    <div class="stat-box">
-      <div class="num" id="completedCount">0</div>
-      <div class="lbl">Done</div>
-    </div>
-    <div class="stat-box">
-      <div class="num" id="failedCount">0</div>
-      <div class="lbl">Failed</div>
-    </div>
+    <div class="status" id="status">Starting</div>
   </div>
 
-  <!-- Currently Processing (this worker) — one card per active job -->
-  <div class="section" id="currentSection" style="display:none">
-    <div class="section-title">This Worker - Active</div>
-    <div id="activeJobsContainer"></div>
-  </div>
+  <div class="scroll">
+    <h2>In progress <b id="nowCount">0</b></h2>
+    <ul id="now"></ul>
 
-  <!-- All processing jobs (including from other workers) -->
-  <div class="section">
-    <div class="section-title">Processing Jobs</div>
-    <ul class="job-list" id="processingList"></ul>
-    <div class="empty" id="processingEmpty">No jobs currently processing</div>
-  </div>
+    <h2>Waiting <b id="waitCount">0</b></h2>
+    <ul id="wait"></ul>
 
-  <div class="section">
-    <div class="section-title">Pending Jobs</div>
-    <ul class="job-list" id="pendingList"></ul>
-    <div class="empty" id="pendingEmpty">No pending jobs</div>
-  </div>
+    <h2>History
+      <span class="switch">
+        <button id="daily" class="on">Daily</button>
+        <button id="weekly">Weekly</button>
+      </span>
+    </h2>
+    <div class="periods"><table>
+      <thead><tr><th id="periodHead">Day</th><th>Done</th><th>Failed</th><th>Cancelled</th></tr></thead>
+      <tbody id="periods"></tbody>
+    </table></div>
 
-  <div class="section">
-    <div class="section-title">Recent Completed</div>
-    <ul class="job-list" id="completedList"></ul>
-    <div class="empty" id="completedEmpty">No completed jobs yet</div>
-  </div>
-
-  <div class="section">
-    <div class="section-title">Cancelled</div>
-    <ul class="job-list" id="cancelledList"></ul>
-    <div class="empty" id="cancelledEmpty">No cancelled jobs</div>
-  </div>
-
-  <div class="section">
-    <div class="section-title">Recent Failed</div>
-    <ul class="job-list" id="failedList"></ul>
-    <div class="empty" id="failedEmpty">No failed jobs</div>
+    <div id="picked"></div>
   </div>
 
   <script>
-    (function setWorkerHeader() {
-      const id = (window.api && window.api.workerId) || 'unknown';
-      const h = document.getElementById('workerHeader');
-      if (h) h.textContent = `GenShape3D Worker [${id}]`;
-      document.title = `GenShape3D Worker [${id}]`;
-    })();
+    const $ = (id) => document.getElementById(id);
+    const workerId = (window.api && window.api.workerId) || 'unknown';
+    $('title').textContent = document.title = `GenShape3D Worker [${workerId}]`;
 
-    function formatTime(ts) {
-      if (!ts) return '';
-      const d = new Date(ts);
-      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const clock = (t) => (t ? new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '');
+    function span(ms) {
+      const s = Math.max(0, Math.round(ms / 1000));
+      if (s < 60) return `${s}s`;
+      if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+      return `${Math.floor(s / 3600)}h ${Math.floor(s / 60) % 60}m`;
     }
 
-    function formatDuration(startTs, endTs) {
-      if (!startTs) return '';
-      const start = new Date(startTs).getTime();
-      const end = endTs ? new Date(endTs).getTime() : Date.now();
-      const secs = Math.round((end - start) / 1000);
-      if (secs < 60) return `${secs}s`;
-      const mins = Math.floor(secs / 60);
-      const remSecs = secs % 60;
-      if (mins < 60) return `${mins}m ${remSecs}s`;
-      const hrs = Math.floor(mins / 60);
-      const remMins = mins % 60;
-      return `${hrs}h ${remMins}m`;
-    }
-
-    function shortId(id) {
-      return id ? id.slice(0, 8) + '...' : '';
-    }
-
-    // R2 endpoint URLs return 400 without auth — route through the i7
-    // server's /api/image proxy. Works from any machine on the LAN or
-    // via the public api.genshape3d.com host.
-    const API_BASE = 'https://api.genshape3d.com';
-    function thumbUrlFromString(url) {
+    // Stored files go through the public image route.
+    const API = 'https://api.genshape3d.com';
+    function fileUrl(url) {
       if (!url) return '';
-      if (url.startsWith('/api/image')) return API_BASE + url;
-      // Match the most common R2 path prefixes our system writes.
-      const prefixes = ['/uploads/', '/mvtest/', '/outputs/', '/mv-auto/'];
-      for (const p of prefixes) {
-        if (url.includes(p)) {
-          const key = p.slice(1) + url.split(p)[1];
-          return API_BASE + '/api/image?key=' + encodeURIComponent(key);
-        }
-      }
+      if (url.startsWith('/api/image')) return API + url;
+      for (const p of ['/uploads/', '/mvtest/', '/outputs/', '/mv-auto/'])
+        if (url.includes(p)) return `${API}/api/image?key=${encodeURIComponent(p.slice(1) + url.split(p)[1])}`;
       return url;
     }
-    function thumbUrl(job) {
-      const url = job && (job.imageUrl || job.image_url);
-      return thumbUrlFromString(url);
+
+    const KIND = { model: '3D model', paint: 'Paint', repair: 'Mesh repair', parts: 'Parts' };
+    const EXIT = {
+      3221225477: 'crashed (memory access violation)',
+      3221226505: 'crashed (stack buffer overrun)',
+      4294967295: 'was stopped from outside',
+      null: 'was killed',
+      1: 'stopped with an error',
+    };
+    /** The first line of a failure in plain words. The whole text stays one click away. */
+    function reason(error) {
+      if (!error) return 'No reason was recorded';
+      const line = String(error).split(/\r?\n/)[0].replace(/^Error:\s*/, '');
+      const m = line.match(/^(.*?) process exited with code (\S+?):/);
+      if (m) return `${m[1]} ${EXIT[m[2]] || `stopped with code ${m[2]}`}`;
+      return line.slice(0, 200);
     }
-    function jobName(job) {
-      return (job && (job.name || '')).trim() || 'Untitled';
+
+    const thumb = (j) => {
+      const u = fileUrl(j.image);
+      return u ? `<img class="thumb" src="${esc(u)}" alt="" loading="lazy">` : '<div class="thumb"></div>';
+    };
+    const tags = (j) => [KIND[j.kind], j.model, j.bench ? 'bench' : ''].filter(Boolean).map(esc).join(' · ');
+
+    function nowRow(j) {
+      const pct = Math.min(100, j.pct || 0);
+      const note = j.orphan ? '<div class="why bad">Marked in progress, but no process on this machine is running it</div>'
+        : j.stillMs > 300000 ? `<div class="why warn">No change for ${span(j.stillMs)}</div>` : '';
+      const cancel = j.kind === 'model' ? `<button data-cancel="${esc(j.id)}">Cancel</button>` : '';
+      return `<li class="job">${thumb(j)}<div class="body">
+        <div class="name">${esc(j.name || 'Untitled')}</div>
+        <div class="meta">${tags(j)} · started ${clock(j.started)} · <span data-since="${esc(j.started)}">${span(Date.now() - new Date(j.started))}</span></div>
+        <div class="meta">${pct}% · ${esc(j.phase || 'Starting')}</div>
+        <div class="bar"><i style="transform:scaleX(${pct / 100})"></i></div>${note}
+      </div><div class="side">${cancel}</div></li>`;
     }
-    function thumbHtml(job, size) {
-      const u = thumbUrl(job);
-      const px = size || 48;
-      if (!u) {
-        return '<div style="width:' + px + 'px;height:' + px + 'px;border-radius:6px;background:#0f3460;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#5a6c80;font-size:11px">no img</div>';
+
+    function waitRow(j) {
+      const cancel = j.kind === 'model' ? `<button data-cancel="${esc(j.id)}">Cancel</button>` : '';
+      return `<li class="job">${thumb(j)}<div class="body">
+        <div class="name">${esc(j.name || 'Untitled')}</div>
+        <div class="meta">${tags(j)} · queued <span data-since="${esc(j.created)}">${span(Date.now() - new Date(j.created))}</span> ago</div>
+        <div class="why ${j.blocked ? 'bad' : ''}">${esc(j.why)}</div>
+      </div><div class="side">${cancel}</div></li>`;
+    }
+
+    function doneRow(j) {
+      const took = j.started && j.finished ? ` · took ${span(new Date(j.finished) - new Date(j.started))}` : '';
+      const peak = j.peak_mb ? ` · GPU peak ${(j.peak_mb / 1024).toFixed(1)} GB` : '';
+      const failed = j.status === 'failed'
+        ? `<div class="why bad">${esc(reason(j.error))}</div>${j.error ? `<details><summary>Full text</summary><pre>${esc(j.error)}</pre></details>` : ''}` : '';
+      const view = j.result ? `<a href="${esc(fileUrl(j.result))}" target="_blank" rel="noopener">View 3D</a>` : '';
+      return `<li class="job">${thumb(j)}<div class="body">
+        <div class="name">${esc(j.name || 'Untitled')}</div>
+        <div class="meta">${tags(j)} · ${clock(j.finished)}${took}${peak}</div>${failed}
+      </div><div class="side"><span class="pill ${esc(j.status)}">${esc(j.status)}</span>${view}</div></li>`;
+    }
+
+    /** Only touches the page when the content changed, so nothing flickers and the scroll stays put. */
+    const shown = {};
+    function put(id, html) {
+      if (shown[id] === html) return;
+      shown[id] = html;
+      $(id).innerHTML = html;
+    }
+
+    // Periods: every week is the sum of its days, so the two views always agree.
+    const pad = (n) => String(n).padStart(2, '0');
+    const dayKey = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const parseDay = (k) => { const [y, m, d] = k.split('-').map(Number); return new Date(y, m - 1, d); };
+    const shortDay = (d) => d.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' });
+    function monday(k) { const d = parseDay(k); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return d; }
+    function dayLabel(k) {
+      const today = new Date(); const y = new Date(); y.setDate(y.getDate() - 1);
+      return k === dayKey(today) ? 'Today' : k === dayKey(y) ? 'Yesterday' : shortDay(parseDay(k));
+    }
+    function periods(days, mode) {
+      const today = dayKey(new Date());
+      const list = days.some((d) => d.day === today) ? days : [{ day: today, done: 0, failed: 0, cancelled: 0 }, ...days];
+      if (mode === 'daily') return list.map((d) => ({ ...d, from: d.day, to: d.day, label: dayLabel(d.day) }));
+      const weeks = new Map();
+      for (const d of list) {
+        const start = monday(d.day); const from = dayKey(start);
+        const end = new Date(start); end.setDate(end.getDate() + 6);
+        const w = weeks.get(from) || { from, to: dayKey(end), done: 0, failed: 0, cancelled: 0,
+          label: from === dayKey(monday(today)) ? 'This week' : `Week of ${shortDay(start)}` };
+        w.done += d.done; w.failed += d.failed; w.cancelled += d.cancelled;
+        weeks.set(from, w);
       }
-      return '<a href="' + u + '" target="_blank" rel="noopener" style="display:block;flex-shrink:0" title="open original"><img src="' + u + '" alt="" style="width:' + px + 'px;height:' + px + 'px;object-fit:cover;border-radius:6px;background:#0f3460" loading="lazy"></a>';
-    }
-    // Render aux view thumbnails for a job. auxImageUrls is the jsonb
-    // array on the row. Each thumb opens its full image in a new tab.
-    function auxThumbsHtml(job, size) {
-      const aux = job && Array.isArray(job.auxImageUrls) ? job.auxImageUrls : [];
-      if (aux.length === 0) return '';
-      const px = size || 36;
-      const items = aux.map(function (url, i) {
-        const u = thumbUrlFromString(url);
-        if (!u) return '';
-        return '<a href="' + u + '" target="_blank" rel="noopener" title="aux view ' + (i + 1) + '" style="display:block">'
-             + '<img src="' + u + '" alt="" style="width:' + px + 'px;height:' + px + 'px;object-fit:cover;border-radius:4px;background:#0f3460;border:1px solid #1a3a5c" loading="lazy"></a>';
-      }).join('');
-      return '<div style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap" title="' + aux.length + ' auxiliary view(s) used for multi-view conditioning">'
-           + '<span style="font-size:9px;color:#5a6c80;align-self:center;margin-right:3px">+' + aux.length + '</span>'
-           + items
-           + '</div>';
-    }
-    // Result mesh link — shown only when the job has a resultUrl. Opens
-    // the GLB through the same /api/image proxy (works for any R2 key).
-    function resultLinkHtml(job) {
-      const url = job && job.resultUrl;
-      if (!url) return '';
-      const proxied = thumbUrlFromString(url);
-      return '<a href="' + proxied + '" target="_blank" rel="noopener" '
-           + 'style="display:inline-block;margin-top:6px;font-size:11px;padding:3px 8px;border-radius:4px;background:#1b3a1b;color:#4caf50;font-weight:600;text-decoration:none" '
-           + 'title="open the generated GLB">View 3D ↗</a>';
+      return [...weeks.values()];
     }
 
-    async function cancelJob(jobId) {
-      if (!confirm(`Cancel job ${jobId.slice(0, 8)}...?`)) return;
-      await window.api.cancelJob(jobId);
+    let mode = 'daily';
+    let pick = null;
+    let days = [];
+
+    const cell = (kind, n) => `<td class="${n ? kind : 'zero'}">${n}</td>`;
+    function drawPeriods() {
+      const list = periods(days, mode);
+      if (!pick || !list.some((p) => p.from === pick.from)) pick = list[0];
+      else pick = list.find((p) => p.from === pick.from);
+      $('periodHead').textContent = mode === 'daily' ? 'Day' : 'Week';
+      put('periods', list.map((p) => `<tr tabindex="0" data-from="${p.from}" class="${p.from === pick.from ? 'on' : ''}">
+        <td>${esc(p.label)}</td>${cell('done', p.done)}${cell('failed', p.failed)}<td>${p.cancelled}</td></tr>`).join(''));
+      drawPicked();
     }
 
-    function renderJobItem(job, statusClass) {
-      let timeInfo = '';
-      if (statusClass === 'processing') {
-        const phase = job.progressPhase || '';
-        const pct = job.progressPct || 0;
-        timeInfo = `<div class="job-time">Started: ${formatTime(job.startedAt)} &mdash; Elapsed: <span class="elapsed-timer" data-started="${job.startedAt}">${formatDuration(job.startedAt)}</span></div>
-                    <div class="job-duration" style="color:#00d2ff">${phase ? phase + ' &mdash; ' + pct + '%' : 'Starting...'}</div>
-                    <div style="height:3px;background:#0f3460;border-radius:2px;margin-top:4px;overflow:hidden"><div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#00d2ff,#ff9800);transition:width 0.5s"></div></div>`;
-      } else if (statusClass === 'done') {
-        timeInfo = `<div class="job-time">Done: ${formatTime(job.completedAt)} &mdash; Took: ${formatDuration(job.startedAt, job.completedAt)}</div>
-                    <div class="job-duration" style="color:#4caf50">${job.progressPhase || 'Complete'}</div>`;
-      } else if (statusClass === 'cancelled') {
-        timeInfo = `<div class="job-time">Cancelled: ${formatTime(job.completedAt)}</div>`;
-      } else if (statusClass === 'failed') {
-        timeInfo = `<div class="job-time">Failed: ${formatTime(job.completedAt)}</div>
-                    <div class="job-duration">${job.error ? job.error.slice(0, 50) : ''}</div>`;
+    let pickedKey = '';
+    let pickedAsk = 0;
+    async function drawPicked() {
+      const key = `${pick.from}|${pick.to}|${pick.done}|${pick.failed}|${pick.cancelled}`;
+      if (key === pickedKey) return;
+      const ask = ++pickedAsk;
+      let rows;
+      try {
+        rows = await window.api.getHistory(pick.from, pick.to);
+      } catch (e) {
+        if (ask === pickedAsk) put('picked', `<div class="why bad">Could not read this period: ${esc(e.message)}</div>`);
+        return;
+      }
+      if (ask !== pickedAsk) return;
+      pickedKey = key;
+      const group = (status, title) => {
+        const these = rows.filter((j) => j.status === status);
+        return these.length ? `<h2>${title} <b>${these.length}</b></h2><ul>${these.map(doneRow).join('')}</ul>` : '';
+      };
+      put('picked', `${group('failed', 'Failed')}${group('done', 'Done')}${group('cancelled', 'Cancelled')}`
+        || `<div class="none">Nothing finished in ${esc(pick.label.toLowerCase())}</div>`);
+    }
+
+    let state = null;
+    function drawStatus() {
+      if (!state) return;
+      const r = state.report;
+      const old = r ? Date.now() - r.at : Infinity;
+      const dbDown = state.reportError || old > 30000;
+      const down = dbDown || state.pollError;
+      let text;
+      if (dbDown) {
+        const why = state.reportError ? state.reportError.message : 'the worker has stopped updating this window';
+        text = `Cannot read the database: ${why}. ${r ? `Everything below is from ${clock(r.at)}.` : 'Nothing below is real yet.'}`;
+      } else if (state.pollError) {
+        text = `Cannot take jobs: ${state.pollError.message}`;
+      } else if (r.inProgress.length) {
+        text = `Working on ${r.inProgress.length}${r.waiting.length ? `, ${r.waiting.length} waiting` : ''}`;
+      } else if (r.waiting.length) {
+        text = `Idle, ${r.waiting.length} waiting`;
       } else {
-        timeInfo = `<div class="job-time">Queued: ${formatTime(job.createdAt)}</div>`;
+        text = 'Idle, nothing waiting';
       }
-
-      const canCancel = statusClass === 'pending' || statusClass === 'processing';
-      const cancelBtn = canCancel
-        ? `<button class="btn-cancel" onclick="cancelJob('${job.id}')">Cancel</button>`
-        : '';
-
-      const model = (job.model || 'hunyuan3d').toLowerCase();
-      const steps = job.inferenceSteps ?? job.steps ?? 0;
-      const isHigh = steps > 10;
-      const hasTex = !!(job.doTexture || job.tex);
-      const octree = job.octreeResolution || 0;
-      const faces  = job.targetFaceCount || 0;
-
-      const texBadge = `<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${hasTex ? '#EC4899' : '#374151'};color:${hasTex ? '#fff' : '#9CA3AF'};margin-right:4px">${hasTex ? 'TEXTURED' : 'NO TEX'}</span>`;
-      const qualBadge = `<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${isHigh ? '#C084FC' : '#374151'};color:${isHigh ? '#fff' : '#9CA3AF'};margin-right:4px">${isHigh ? 'HIGH' : 'STD'}</span>`;
-      const extra = (octree || faces || steps) ? `<span style="font-size:10px;color:#5a6c80;margin-left:2px">${steps ? steps + ' steps' : ''}${steps && octree ? ' · ' : ''}${octree ? 'octree ' + octree : ''}${(steps||octree) && faces ? ' · ' : ''}${faces ? (faces/1000).toFixed(0) + 'k faces' : ''}</span>` : '';
-
-      return `
-        <li class="job-item" style="display:flex;gap:10px;align-items:flex-start">
-          <div style="display:flex;flex-direction:column;align-items:center;gap:4px;flex-shrink:0">
-            ${thumbHtml(job, 56)}
-            ${auxThumbsHtml(job, 28)}
-          </div>
-          <div style="flex:1;min-width:0">
-            <div style="font-weight:600;color:#e0e0e0;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${jobName(job)}</div>
-            <div style="margin:3px 0">${texBadge}${qualBadge}<span class="model-tag ${model}">${model}</span>${extra}</div>
-            <div class="job-id" style="font-size:10px;color:#5a6c80">${shortId(job.id)}</div>
-            ${timeInfo}
-            ${resultLinkHtml(job)}
-          </div>
-          <div class="job-right">
-            <span class="badge ${statusClass}">${job.status || statusClass}</span>
-            ${cancelBtn}
-          </div>
-        </li>`;
+      $('status').textContent = text;
+      $('status').className = down ? 'status down' : 'status';
+      $('dot').className = `dot ${down ? 'down' : r && r.inProgress.length ? 'busy' : 'ok'}`;
     }
 
-    function update(state) {
-      // Stats
-      // Stat boxes show TRUE all-time totals (the lists below are recent-only,
-      // capped at 20 — using their length here undercounted, e.g. "20 done").
-      const counts = state.counts || {};
-      document.getElementById('pendingCount').textContent = counts.pending ?? state.pendingJobs.length;
-      document.getElementById('processingCount').textContent = counts.processing ?? state.processingJobs.length;
-      document.getElementById('completedCount').textContent = counts.done ?? state.completedJobs.length;
-      document.getElementById('failedCount').textContent = counts.failed ?? state.failedJobs.length;
-
-      // Status dot
-      const dot = document.getElementById('statusDot');
-      dot.className = state.isProcessing ? 'status-dot busy' : 'status-dot idle';
-
-      // Active jobs (this worker) — one card per running job. With
-      // MAX_CONCURRENT>1 the old single "currentJob" card hid the second job.
-      const section = document.getElementById('currentSection');
-      const active = state.processingJobs || [];
-      if (active.length > 0) {
-        section.style.display = '';
-        document.getElementById('activeJobsContainer').innerHTML = active.map(cj => {
-          const cjModel  = (cj.model || 'hunyuan3d').toLowerCase();
-          const cjSteps  = cj.inferenceSteps ?? 0;
-          const cjHigh   = cjSteps > 10;
-          const cjTex    = !!cj.doTexture;
-          const cjOct    = cj.octreeResolution || 0;
-          const cjFaces  = cj.targetFaceCount || 0;
-          // Progress: live in-memory for the job the tray process owns; DB
-          // columns (progressPct/progressPhase) for the rest — same numbers,
-          // just written by the runner via updateProgress().
-          const pct    = (state.currentJob && state.currentJob.id === cj.id && state.currentJob.progress)
-            ? state.currentJob.progress.pct : (cj.progressPct || 0);
-          const detail = (state.currentJob && state.currentJob.id === cj.id && state.currentJob.progress)
-            ? (state.currentJob.progress.detail || state.currentJob.progress.phase) : (cj.progressPhase || '');
-          return `
-          <div class="current-job" style="display:flex;gap:14px;align-items:flex-start;margin-bottom:10px">
-            <div>
-              <div style="display:flex;flex-direction:column;align-items:center;gap:6px">
-                ${thumbHtml(cj, 96)}${auxThumbsHtml(cj, 44)}${resultLinkHtml(cj)}
-              </div>
-            </div>
-            <div style="flex:1;min-width:0">
-              <div class="label">Processing Now</div>
-              <div style="font-size:15px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px">${jobName(cj)}</div>
-              <div class="id">
-                <div style="margin:4px 0 6px">
-                  <span style="display:inline-block;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.04em;background:${cjTex?'#EC4899':'#374151'};color:${cjTex?'#fff':'#9CA3AF'};margin-right:5px">${cjTex?'TEXTURED':'NO TEXTURE'}</span>
-                  <span style="display:inline-block;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.04em;background:${cjHigh?'#C084FC':'#374151'};color:${cjHigh?'#fff':'#9CA3AF'};margin-right:5px">${cjHigh?'HIGH':'STANDARD'}</span>
-                  <span class="model-tag ${cjModel}">${cjModel}</span>
-                </div>
-                <div style="font-size:11px;color:#5a6c80;margin-bottom:4px">
-                  ${cjSteps ? cjSteps + ' steps · ' : ''}${cjOct ? 'octree ' + cjOct : ''}${cjOct && cjFaces ? ' · ' : ''}${cjFaces ? (cjFaces/1000).toFixed(0) + 'k faces target' : ''}
-                </div>
-                <div style="font-family:Consolas,monospace;font-size:11px;color:#5a6c80">${cj.id}</div>
-              </div>
-              <div class="times">Started: <span>${formatTime(cj.startedAt)}</span> &mdash; Elapsed: <span class="elapsed-timer" data-started="${cj.startedAt}">${formatDuration(cj.startedAt)}</span></div>
-              <div>${pct > 0
-                ? `<span class="progress-detail">${detail} &mdash; ${pct}%</span>`
-                : '<span class="progress-detail">Starting...</span>'}</div>
-              <div class="progress"><div class="progress-bar" style="${pct > 0 ? `animation:none;width:${pct}%;transition:width 0.5s ease` : ''}"></div></div>
-              <button class="btn-cancel" onclick="cancelJob('${cj.id}')">Cancel Job</button>
-            </div>
-          </div>`;
-        }).join('');
-      } else {
-        section.style.display = 'none';
-        document.getElementById('activeJobsContainer').innerHTML = '';
-      }
-
-      // Processing jobs (from DB)
-      renderList('processingList', 'processingEmpty', state.processingJobs, 'processing');
-
-      // Pending
-      renderList('pendingList', 'pendingEmpty', state.pendingJobs, 'pending');
-
-      // Completed
-      renderList('completedList', 'completedEmpty', state.completedJobs, 'done');
-
-      // Cancelled
-      renderList('cancelledList', 'cancelledEmpty', state.cancelledJobs || [], 'cancelled');
-
-      // Failed
-      renderList('failedList', 'failedEmpty', state.failedJobs, 'failed');
+    function update(next) {
+      state = next;
+      drawStatus();
+      const r = state.report;
+      if (!r) return;
+      $('gpu').textContent = r.gpu ? `GPU memory ${r.gpu.usedGb.toFixed(1)} of ${r.gpu.totalGb.toFixed(1)} GB` : 'GPU memory unknown';
+      $('nowCount').textContent = r.inProgress.length;
+      $('waitCount').textContent = r.waiting.length;
+      put('now', r.inProgress.map(nowRow).join('') || '<li class="none">Nothing running</li>');
+      put('wait', r.waiting.map(waitRow).join('') || '<li class="none">Nothing waiting</li>');
+      days = r.days;
+      drawPeriods();
     }
 
-    function renderList(listId, emptyId, jobs, statusClass) {
-      const list = document.getElementById(listId);
-      const empty = document.getElementById(emptyId);
-      if (jobs.length > 0) {
-        list.innerHTML = jobs.map(j => renderJobItem(j, statusClass)).join('');
-        empty.style.display = 'none';
-      } else {
-        list.innerHTML = '';
-        empty.style.display = '';
-      }
+    function choose(row) {
+      if (!row) return;
+      pick = periods(days, mode).find((p) => p.from === row.dataset.from);
+      drawPeriods();
     }
+    $('periods').addEventListener('click', (e) => choose(e.target.closest('tr')));
+    $('periods').addEventListener('keydown', (e) => { if (e.key === 'Enter') choose(e.target.closest('tr')); });
+    for (const m of ['daily', 'weekly']) $(m).addEventListener('click', () => {
+      mode = m; pick = null;
+      $('daily').className = m === 'daily' ? 'on' : '';
+      $('weekly').className = m === 'weekly' ? 'on' : '';
+      drawPeriods();
+    });
+    document.addEventListener('click', async (e) => {
+      const id = e.target.dataset && e.target.dataset.cancel;
+      if (id && confirm(`Cancel job ${id.slice(0, 8)}?`)) await window.api.cancelJob(id);
+    });
 
-    // Initial load
     window.api.getState().then(update);
-
-    // Live updates from main process — full re-render only on real state changes
     window.api.onJobUpdate(update);
 
-    // Lightweight elapsed-timer tick — patches only the elapsed spans in place,
-    // never touches list innerHTML so images do not flicker or reload.
-    function tickElapsed() {
-      document.querySelectorAll('.elapsed-timer[data-started]').forEach(function (el) {
-        el.textContent = formatDuration(el.getAttribute('data-started'));
-      });
-    }
-    setInterval(tickElapsed, 1000);
+    // The clocks and the "is this still fresh" check run here, so a frozen worker shows as frozen.
+    setInterval(() => {
+      for (const el of document.querySelectorAll('[data-since]')) el.textContent = span(Date.now() - new Date(el.dataset.since));
+      drawStatus();
+    }, 1000);
   </script>
 </body>
 </html>

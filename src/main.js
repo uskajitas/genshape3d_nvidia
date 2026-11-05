@@ -91,8 +91,8 @@ function createWindow() {
   }
 
   mainWindow = new BrowserWindow({
-    width: 500,
-    height: 600,
+    width: 680,
+    height: 820,
     resizable: true,
     skipTaskbar: true,
     frame: true,
@@ -241,9 +241,11 @@ app.on('ready', () => {
   });
 
   worker.start();
+  if (process.argv.includes('--show')) createWindow();
 
   // IPC handlers
   ipcMain.handle('get-state', () => worker.getState());
+  ipcMain.handle('get-history', (_e, from, to) => worker.history(from, to));
   ipcMain.handle('cancel-job', (_e, jobId) => worker.cancelJob(jobId));
 });
 
