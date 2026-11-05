@@ -1,6 +1,7 @@
 const { EventEmitter } = require('events');
 const { readReport, readHistory } = require('./report');
 const { GpuRoom } = require('./gpuRoom');
+const { CardPolicy } = require('./cardPolicy');
 const { Pool } = require('pg');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { spawn } = require('child_process');
@@ -66,7 +67,8 @@ class Worker extends EventEmitter {
     this.completedJobs = [];
     this.failedJobs = [];
     this.cancelledJobs = [];
-    this.gpuRoom = new GpuRoom();
+    this.card = new CardPolicy(() => this.activeCount > 0 || (this._pendingForClaim || []).length > 0);
+    this.gpuRoom = new GpuRoom(this.card);
   }
 
   getState() {
@@ -102,7 +104,11 @@ class Worker extends EventEmitter {
         activeCount: this.activeCount,
       });
       read.catch(() => {});
-      this.report = await Promise.race([read, new Promise((_, no) => { timer = setTimeout(() => no(new Error('the database did not answer in 15 seconds')), 15000); })]);
+      const report = await Promise.race([read, new Promise((_, no) => { timer = setTimeout(() => no(new Error('the database did not answer in 15 seconds')), 15000); })]);
+      const picture = this.card.holder();
+      if (picture) report.inProgress.unshift({ kind: 'picture', id: 'picture', name: picture.what || 'Picture', model: picture.who, started: picture.since, stillMs: 0 });
+      report.refused = this.card.refused;
+      this.report = report;
       this.reportError = null;
     } catch (err) {
       this.reportError = { message: err.message, at: Date.now() };
@@ -117,6 +123,7 @@ class Worker extends EventEmitter {
 
   async start() {
     console.log('[Worker] Starting poll loop...');
+    this.card.serve();
     this.refreshReport();
     this.reportTimer = setInterval(() => this.refreshReport(), 5000);
     await this.ensureTable();

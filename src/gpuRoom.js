@@ -43,7 +43,8 @@ async function neighbourLoading() {
 }
 
 class GpuRoom {
-  constructor() {
+  constructor(card) {
+    this.card = card;
     this.held = new Map();      // job id -> why it is waiting, shown in the window
     this.since = new Map();     // job id -> when it started waiting
     this.askedAt = 0;
@@ -54,6 +55,10 @@ class GpuRoom {
   /** True when the job may start now. */
   async ready(id, heavy) {
     const need = heavy ? NEED_HEAVY_GB : NEED_LIGHT_GB;
+    if (this.card.holder()) {
+      this.held.set(id, 'Next: the RTX 3090 is finishing a picture');
+      return false;
+    }
     const loading = await neighbourLoading();
     let card = await gpu();
     if (!loading && (!card || card.freeGb >= need)) { this.release(id); return true; }
