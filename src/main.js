@@ -6,6 +6,13 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const { app, Tray, Menu, BrowserWindow, Notification, ipcMain, nativeImage } = require('electron');
+
+// On a machine where ugpu runs the worker with no window (src/headless.js under pm2), this app must
+// not start a second worker beside it: two would claim the same jobs.
+if (/^(1|true|yes)$/i.test(process.env.WORKER_HEADLESS || '')) {
+  console.log('This machine runs the 3D worker inside ugpu (pm2: ugpu-3d). Its screen is http://127.0.0.1:8460.');
+  app.exit(0);
+}
 const fs = require('fs');
 const { Worker } = require('./worker');
 

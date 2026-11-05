@@ -65,20 +65,39 @@ function describe(kind, job) {
   return { app: appOf(job.source), title: job.name || job.prompt || job.id.slice(0, 8), model: MODELS[id] || job.model || '', detail, imageUrl: job.imageUrl };
 }
 
-/** A small picture of what the job was given, for its row in ugpu. Never holds a job up for long. */
+// Makes the small picture with the Python the runners already have (Pillow), so the worker needs no
+// window toolkit and no image library of its own.
+const THUMB_PY = [
+  "import sys, io, base64",
+  "from PIL import Image",
+  "im = Image.open(io.BytesIO(sys.stdin.buffer.read())).convert('RGBA')",
+  "bg = Image.new('RGB', im.size, (255, 255, 255))",
+  "bg.paste(im, mask=im.split()[3])",
+  "bg.thumbnail((160, 160))",
+  "out = io.BytesIO()",
+  "bg.save(out, 'JPEG', quality=80)",
+  "sys.stdout.write(base64.b64encode(out.getvalue()).decode())",
+].join('\n');
+
+/** A small picture of what the job was given, for its row in ugpu. Never holds a job up. */
 async function thumbOf(url) {
-  if (!url) return null;
+  if (!url || !process.env.PYTHON_CMD) return null;
   try {
-    const { nativeImage } = require('electron');
-    const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
     if (!r.ok) return null;
-    const image = nativeImage.createFromBuffer(Buffer.from(await r.arrayBuffer()));
-    if (image.isEmpty()) return null;
-    const { width, height } = image.getSize();
-    const side = 160 / Math.max(width, height);
-    return image.resize({ width: Math.round(width * side), height: Math.round(height * side), quality: 'good' }).toJPEG(80).toString('base64');
+    const picture = Buffer.from(await r.arrayBuffer());
+    return await new Promise((done) => {
+      const py = spawn(process.env.PYTHON_CMD, ['-c', THUMB_PY], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+      const timer = setTimeout(() => py.kill(), 20000);
+      let out = '';
+      py.stdout.on('data', (d) => { out += d; });
+      py.on('error', () => done(null));
+      py.on('close', (code) => { clearTimeout(timer); done(code === 0 && out ? out : null); });
+      py.stdin.on('error', () => {});
+      py.stdin.end(picture);
+    });
   } catch {
-    return null; // not in Electron, or the picture is gone: the row shows its icon
+    return null; // the picture is gone: the row shows its icon
   }
 }
 

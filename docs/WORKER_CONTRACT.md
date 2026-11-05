@@ -3,6 +3,13 @@
 Every agent reads this before changing the worker, the picture services or the worker window.
 If code and this page disagree, the code is wrong.
 
+## On the 3090 the worker has no window
+
+It runs as the pm2 process `ugpu-3d` (`src/headless.js`, listed in `ugpu/ecosystem.config.cjs`). The
+screen is ugpu's, at `http://127.0.0.1:8460`. The tray app (`src/main.js`) is for machines without
+ugpu; on the 3090 it refuses to start (`WORKER_HEADLESS=true` in `.env`). Where this page says the
+worker window, read ugpu's screen. Restart with `pm2 restart ugpu-3d` when no 3D job is running.
+
 ## One source of truth
 
 `ugpu` owns the card, the queue and the ledger on the 3090 (`ugpu/docs/CONTRACT.md`). Everything on
