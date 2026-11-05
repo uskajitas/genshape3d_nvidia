@@ -67,7 +67,7 @@ class Worker extends EventEmitter {
     this.completedJobs = [];
     this.failedJobs = [];
     this.cancelledJobs = [];
-    this.card = new CardPolicy(() => this.activeCount > 0 || (this._pendingForClaim || []).length > 0);
+    this.card = new CardPolicy(() => this.activeCount > 0);
     this.gpuRoom = new GpuRoom(this.card);
   }
 
@@ -107,7 +107,7 @@ class Worker extends EventEmitter {
       const report = await Promise.race([read, new Promise((_, no) => { timer = setTimeout(() => no(new Error('the database did not answer in 15 seconds')), 15000); })]);
       const picture = this.card.holder();
       if (picture) report.inProgress.unshift({ kind: 'picture', id: 'picture', name: picture.what || 'Picture', model: picture.who, started: picture.since, stillMs: 0 });
-      report.refused = this.card.refused;
+      report.waiting.unshift(...this.card.waiting().map((p) => ({ kind: 'picture', id: p.key, name: p.what, model: p.who, created: p.since, why: 'Goes when the card is free' })));
       this.report = report;
       this.reportError = null;
     } catch (err) {

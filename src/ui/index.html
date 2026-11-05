@@ -19,9 +19,7 @@
     .top { background: var(--panel); border-bottom: 1px solid var(--line); padding: 12px 16px; flex: none; }
     .top-row { display: flex; align-items: center; gap: 10px; }
     h1 { font-size: 15px; font-weight: 600; color: var(--accent); }
-    #refused { margin-left: auto; }
-    #refused + .gpu { margin-left: 12px; }
-    .gpu { color: var(--muted); font-variant-numeric: tabular-nums; }
+    .gpu { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
     .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
     .dot.ok { background: var(--good); } .dot.busy { background: var(--warn); } .dot.down { background: var(--bad); }
     .status { height: 38px; margin-top: 6px; overflow: hidden; font-size: 13px; }
@@ -76,7 +74,6 @@
     <div class="top-row">
       <div class="dot" id="dot"></div>
       <h1 id="title">GenShape3D Worker</h1>
-      <div class="gpu" id="refused"></div>
       <div class="gpu" id="gpu"></div>
     </div>
     <div class="status" id="status">Starting</div>
@@ -292,7 +289,6 @@
       if (!r) return;
       $('gpu').textContent = r.gpu ? `GPU memory ${r.gpu.usedGb.toFixed(1)} of ${r.gpu.totalGb.toFixed(1)} GB` : 'GPU memory unknown';
       $('nowCount').textContent = r.inProgress.length;
-      $('refused').textContent = r.refused ? `Refused while busy: ${r.refused}` : '';
       $('waitCount').textContent = r.waiting.length;
       put('now', r.inProgress.map(nowRow).join('') || '<li class="none">Nothing running</li>');
       put('wait', r.waiting.map(waitRow).join('') || '<li class="none">Nothing waiting</li>');

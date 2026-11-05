@@ -1,27 +1,31 @@
 // THE POLICY OF THE RTX 3090. One place, one rule set.
 //
-//   1. One thing on the card at a time.
-//   2. 3D comes first. While a 3D job runs or waits, every picture is refused.
-//   3. A picture that arrives while the card is taken is refused at once. It does not queue, and
-//      it does not load beside anything.
+//   1. One thing on the card at a time. Nothing loads beside anything.
+//   2. A running 3D job is never disturbed.
+//   3. Nothing is turned away: everything waits its turn. 3D jobs wait in the jobs table, pictures
+//      wait here, oldest first. A waiting picture goes when the running job ends, before the next
+//      3D job starts, because it takes seconds and a 3D job takes minutes.
 //
-// The worker holds the answer because it knows the 3D queue. The picture services ask it on
-// 127.0.0.1 before touching the card. If the worker is not running there is no 3D to protect, so
-// they carry on as they did before (image-edit/card.py).
+// A picture waits by asking again: its service answers "busy", the server asks again every 20
+// seconds (waitForGpu), and its place here is kept for as long as it keeps asking. Nothing holds a
+// connection open for the length of a 3D job.
+//
+// The worker holds the answer because it knows what is running. If the worker is not running there
+// is nothing to protect, so the picture services carry on as they did before (image-edit/card.py).
 const http = require('http');
 
 const PORT = Number(process.env.CARD_PORT || 8440);
 const LEASE_MS = 15 * 60_000;   // a picture service that dies cannot hold the card for longer than this
+const PLACE_MS = 75_000;        // a picture that stops asking has gone away: it loses its place
 
-const BUSY_3D = 'The RTX 3090 is busy making a 3D model. Send this again when it finishes.';
-const BUSY_PICTURE = 'The RTX 3090 is busy with another picture. Send this again in a moment.';
+const BUSY = 'The RTX 3090 is busy: this waits its turn.';
 
 class CardPolicy {
-  /** @param {() => boolean} busy3d true while a 3D job runs or waits on this machine */
+  /** @param {() => boolean} busy3d true while a 3D job runs on this machine */
   constructor(busy3d) {
     this.busy3d = busy3d;
     this.lease = null;
-    this.refused = 0;
+    this.line = [];             // pictures waiting, oldest first: { key, who, what, since, seen }
   }
 
   /** Who holds the card for a picture right now, if anyone. */
@@ -33,15 +37,28 @@ class CardPolicy {
     return this.lease;
   }
 
-  /** Null when the card is now theirs, otherwise the words of the refusal. */
+  /** The pictures waiting, oldest first. */
+  waiting() {
+    const now = Date.now();
+    this.line = this.line.filter((p) => now - p.seen < PLACE_MS);
+    return this.line;
+  }
+
+  /** Null when the card is now theirs, otherwise the words saying to ask again. */
   take(who, what) {
-    const why = this.busy3d() ? BUSY_3D : this.holder() ? BUSY_PICTURE : null;
-    if (why) {
-      this.refused++;
-      console.log(`[Card] refused ${who}: ${why}`);
-      return why;
+    const text = String(what || who).slice(0, 80);
+    const key = `${who}|${text}`;
+    const line = this.waiting();
+    let place = line.find((p) => p.key === key);
+    if (!place) {
+      place = { key, who, what: text, since: new Date().toISOString(), seen: 0 };
+      line.push(place);
+      console.log(`[Card] ${who} joins the line (${line.length} waiting)`);
     }
-    this.lease = { who, what: String(what || '').slice(0, 80), since: new Date().toISOString(), expires: Date.now() + LEASE_MS };
+    place.seen = Date.now();
+    if (this.busy3d() || this.holder() || line[0] !== place) return BUSY;
+    line.shift();
+    this.lease = { who, what: text, since: new Date().toISOString(), expires: Date.now() + LEASE_MS };
     return null;
   }
 
@@ -52,7 +69,7 @@ class CardPolicy {
   serve() {
     this.server = http.createServer((req, res) => {
       const answer = (code, body) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
-      if (req.method === 'GET') return answer(200, { holder: this.holder(), busy3d: this.busy3d(), refused: this.refused });
+      if (req.method === 'GET') return answer(200, { holder: this.holder(), waiting: this.waiting(), busy3d: this.busy3d() });
       let raw = '';
       req.on('data', (d) => { raw += d; if (raw.length > 4096) req.destroy(); });
       req.on('end', () => {

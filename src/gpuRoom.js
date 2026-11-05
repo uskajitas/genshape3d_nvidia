@@ -55,8 +55,8 @@ class GpuRoom {
   /** True when the job may start now. */
   async ready(id, heavy) {
     const need = heavy ? NEED_HEAVY_GB : NEED_LIGHT_GB;
-    if (this.card.holder()) {
-      this.held.set(id, 'Next: the RTX 3090 is finishing a picture');
+    if (this.card.holder() || this.card.waiting().length) {
+      this.held.set(id, 'Next, after the picture on the RTX 3090');
       return false;
     }
     const loading = await neighbourLoading();
