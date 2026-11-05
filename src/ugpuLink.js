@@ -17,17 +17,84 @@ async function post(path, body) {
   return r.json();
 }
 
+const MODELS = {
+  trellis2: 'Trellis 2',
+  hunyuan3d: 'Hunyuan3D 2',
+  'hunyuan3d-2-1': 'Hunyuan3D 2.1',
+  hi3dgen: 'Hi3DGen',
+  triposr: 'TripoSR',
+  sf3d: 'SF3D',
+  spar3d: 'SPAR3D',
+  partcrafter: 'PartCrafter',
+  multiview: 'Multi-view',
+};
+
+/** Which app asked, from where the job row says it came. */
+function appOf(source) {
+  const s = String(source || '').toLowerCase();
+  if (s.includes('uskiano')) return 'uskiano';
+  if (s.includes('ufleet')) return 'ufleet';
+  if (s === 'batch') return 'genshape3d';
+  if (s) return 'ugen3d';
+  return 'genshape3d';
+}
+
+const faces = (n) => (n >= 1e6 ? `${+(n / 1e6).toFixed(1)}M faces` : n >= 1000 ? `${Math.round(n / 1000)}k faces` : '');
+
+/** What ugpu shows for a job row of the database: its name, its model and its options in words. */
+function describe(kind, job) {
+  if (kind === 'paint') {
+    return {
+      app: 'ugen3d',
+      title: `Paint ${job.name || job.prompt || job.id.slice(0, 8)}`.slice(0, 80),
+      model: 'Hunyuan3D Paint',
+      detail: [job.textureRes && `${job.textureRes} texture`, job.materialPreset, job.keepShape && 'keeps the shape'].filter(Boolean).join(', '),
+      imageUrl: job.sourceImageUrl,
+    };
+  }
+  if (kind === 'parts') {
+    return { app: 'ugen3d', title: `Parts ${job.id.slice(0, 8)}`, model: 'PartField', detail: job.faceCount ? faces(job.faceCount) : '' };
+  }
+  const id = (job.model || 'hunyuan3d').toLowerCase();
+  const views = Array.isArray(job.recipe?.views) ? job.recipe.views.length + 1 : job.useMultiView ? 4 : 1;
+  const detail = [
+    views > 1 && `${views} views`,
+    job.doTexture ? `${job.textureRes || '1K'} texture` : 'shape only',
+    faces(job.targetFaceCount || 0),
+  ].filter(Boolean).join(', ');
+  return { app: appOf(job.source), title: job.name || job.prompt || job.id.slice(0, 8), model: MODELS[id] || job.model || '', detail, imageUrl: job.imageUrl };
+}
+
+/** A small picture of what the job was given, for its row in ugpu. Never holds a job up for long. */
+async function thumbOf(url) {
+  if (!url) return null;
+  try {
+    const { nativeImage } = require('electron');
+    const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return null;
+    const image = nativeImage.createFromBuffer(Buffer.from(await r.arrayBuffer()));
+    if (image.isEmpty()) return null;
+    const { width, height } = image.getSize();
+    const side = 160 / Math.max(width, height);
+    return image.resize({ width: Math.round(width * side), height: Math.round(height * side), quality: 'good' }).toJPEG(80).toString('base64');
+  } catch {
+    return null; // not in Electron, or the picture is gone: the row shows its icon
+  }
+}
+
 class UgpuLink {
   /** @param worker the worker: its pool, its cancelJob and its running process */
   constructor(worker) {
     this.worker = worker;
     this.held = new Map();      // worker job id -> { ugpuId, step, total, phase }
+    this.thumbs = new Map();    // worker job id -> its small picture, fetched once
     setInterval(() => this.beat(), BEAT_MS).unref();
   }
 
   /** 'go' when the card is ours, 'wait' to ask again at the next poll, 'down' if ugpu is not there. */
   async ask(id, heavy, info = {}) {
     if (this.held.has(id)) return 'go';
+    if (!this.thumbs.has(id)) this.thumbs.set(id, thumbOf(info.imageUrl));
     try {
       const job = await post('/api/jobs', {
         key: `3d|${id}`,
@@ -37,8 +104,10 @@ class UgpuLink {
         detail: info.detail || '',
         model: info.model || '',
         memoryGb: heavy ? 16 : 8,
+        thumb: (await this.thumbs.get(id)) || undefined,
       });
       if (job.status !== 'in_progress') return 'wait';
+      this.thumbs.delete(id);
       this.held.set(id, { ugpuId: job.id, step: 0, total: 0, phase: '' });
       return 'go';
     } catch {
@@ -103,4 +172,4 @@ class UgpuLink {
   }
 }
 
-module.exports = { UgpuLink };
+module.exports = { UgpuLink, describe };

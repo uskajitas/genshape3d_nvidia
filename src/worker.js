@@ -1,7 +1,7 @@
 const { EventEmitter } = require('events');
 const { readReport, readHistory } = require('./report');
 const { GpuRoom } = require('./gpuRoom');
-const { UgpuLink } = require('./ugpuLink');
+const { UgpuLink, describe } = require('./ugpuLink');
 const { Pool } = require('pg');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { spawn } = require('child_process');
@@ -529,7 +529,7 @@ class Worker extends EventEmitter {
             || (isHeavy(nextJob) && (this.processingJobs.length > 0 || this.refineActive));
           if (blocked) {
             console.log(`[Worker] holding ${nextJob.id.slice(0,8)} — GPU exclusivity (heavy job running or queued job is heavy).`);
-          } else if (this.activeCount > 0 || await this.gpuRoom.ready(nextJob.id, isHeavy(nextJob), { title: nextJob.name, model: nextJob.model })) {
+          } else if (this.activeCount > 0 || await this.gpuRoom.ready(nextJob.id, isHeavy(nextJob), describe('model', nextJob))) {
             this.processJob(nextJob);
           }
         }
@@ -546,7 +546,7 @@ class Worker extends EventEmitter {
              ORDER BY "createdAt" ASC
              LIMIT 1`,
           );
-          if (texPending.length > 0 && await this.gpuRoom.ready(texPending[0].id, true, { title: `Paint ${texPending[0].name || texPending[0].id.slice(0, 8)}` })) {
+          if (texPending.length > 0 && await this.gpuRoom.ready(texPending[0].id, true, describe('paint', texPending[0]))) {
             console.log(`[Worker] Picking up texture job ${texPending[0].id.slice(0, 8)}`);
             this.processTextureJob(texPending[0]);
           }
@@ -586,7 +586,7 @@ class Worker extends EventEmitter {
              ORDER BY "createdAt" ASC
              LIMIT 1`,
           );
-          if (segPending.length > 0 && await this.gpuRoom.ready(segPending[0].id, false, { title: `Parts ${segPending[0].id.slice(0, 8)}` })) {
+          if (segPending.length > 0 && await this.gpuRoom.ready(segPending[0].id, false, describe('parts', segPending[0]))) {
             console.log(`[Worker] Picking up segment job ${segPending[0].id.slice(0, 8)}`);
             this.processSegmentJob(segPending[0]);
           }
