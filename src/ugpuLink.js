@@ -120,6 +120,13 @@ class UgpuLink {
     }
   }
 
+  /** Jobs waiting behind the one this worker is running: asking again keeps their place. */
+  async keep(waiting) {
+    for (const [id, heavy, info] of waiting) {
+      if ((await this.ask(id, heavy, info)) === 'down') return;
+    }
+  }
+
   /** Forgets the pictures of jobs that are no longer waiting or running. */
   forget(waitingIds) {
     const keep = new Set(waitingIds);

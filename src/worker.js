@@ -5,6 +5,12 @@ const { UgpuLink, describe } = require('./ugpuLink');
 
 /** How many waiting jobs are shown in ugpu's queue at once. */
 const WALL_LINE = 25;
+
+/** A job that needs the card to itself: textured Hunyuan3D, Hi3DGen, Trellis 2. */
+const isHeavyJob = (j) => {
+  const m = (j.model || 'hunyuan3d').toLowerCase();
+  return ((m === 'hunyuan3d' || m === 'hunyuan3d-2-1') && j.doTexture) || m === 'hi3dgen' || m === 'trellis2';
+};
 const { Pool } = require('pg');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { spawn } = require('child_process');
@@ -548,6 +554,11 @@ class Worker extends EventEmitter {
             }
           }
         }
+      } else if (this._pendingForClaim.length > 0) {
+        // Busy: the jobs behind this one keep their place in ugpu's queue while it runs.
+        const waiting = this._pendingForClaim.filter((j) => !j.requestCancel).slice(0, WALL_LINE);
+        this.ugpu.forget(waiting.map((j) => j.id));
+        await this.ugpu.keep(waiting.map((j) => [j.id, isHeavyJob(j), describe('model', j)]));
       }
 
       // ── Texture jobs ──────────────────────────────────────────────────────
