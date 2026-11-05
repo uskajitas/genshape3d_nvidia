@@ -21,6 +21,24 @@ console.error = (...a) => log.write(`[${ts()}] ERROR ${a.join(' ')}\n`);
 process.on('uncaughtException', (e) => { if (e?.code === 'EPIPE') return; console.error('uncaughtException:', (e && e.stack) || e); });
 process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', (e && e.stack) || e); });
 
+// No window, ever. pm2 starts this process with no console, and Windows gives a console program
+// started from such a process a console window of its own: every runner, and the card reading every
+// two seconds, would open one on the desktop, and closing it kills the job. So every process the
+// worker starts is started hidden. This is set before worker.js takes its copy of spawn.
+const childProcess = require('child_process');
+for (const name of ['spawn', 'execFile']) {
+  const start = childProcess[name];
+  childProcess[name] = function (...args) {
+    const at = args.findIndex((x, i) => i > 0 && x && typeof x === 'object' && !Array.isArray(x));
+    if (at >= 0) args[at] = { windowsHide: true, ...args[at] };
+    else {
+      const callback = args.findIndex((x) => typeof x === 'function');
+      args.splice(callback >= 0 ? callback : args.length, 0, { windowsHide: true });
+    }
+    return start.apply(this, args);
+  };
+}
+
 const { Worker } = require('./worker');
 
 const worker = new Worker({
