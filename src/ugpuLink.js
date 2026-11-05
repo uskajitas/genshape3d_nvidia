@@ -87,14 +87,13 @@ class UgpuLink {
   constructor(worker) {
     this.worker = worker;
     this.held = new Map();      // worker job id -> { ugpuId, step, total, phase }
-    this.thumbs = new Map();    // worker job id -> its small picture, fetched once
+    this.thumbs = new Map();    // worker job id -> its small picture once fetched, null until then
     setInterval(() => this.beat(), BEAT_MS).unref();
   }
 
   /** 'go' when the card is ours, 'wait' to ask again at the next poll, 'down' if ugpu is not there. */
   async ask(id, heavy, info = {}) {
     if (this.held.has(id)) return 'go';
-    if (!this.thumbs.has(id)) this.thumbs.set(id, thumbOf(info.imageUrl));
     try {
       const job = await post('/api/jobs', {
         key: `3d|${id}`,
@@ -104,10 +103,15 @@ class UgpuLink {
         detail: info.detail || '',
         model: info.model || '',
         memoryGb: heavy ? 16 : 8,
-        thumb: (await this.thumbs.get(id)) || undefined,
+        thumb: this.thumbs.get(id) || undefined,
       });
+      // The picture is fetched only once ugpu has answered, and never holds the job up: it follows
+      // with the next ask, or with the next report.
+      if (!job.hasThumb && !this.thumbs.has(id)) {
+        this.thumbs.set(id, null);
+        thumbOf(info.imageUrl).then((t) => { if (this.thumbs.has(id)) this.thumbs.set(id, t); });
+      }
       if (job.status !== 'in_progress') return 'wait';
-      this.thumbs.delete(id);
       this.held.set(id, { ugpuId: job.id, step: 0, total: 0, phase: '' });
       return 'go';
     } catch {
@@ -138,6 +142,7 @@ class UgpuLink {
       try {
         const body = { phase: h.phase };
         if (h.total) Object.assign(body, { done: h.step, total: h.total });
+        if (this.thumbs.get(id)) { body.thumb = this.thumbs.get(id); this.thumbs.delete(id); }
         const r = await post(`/api/jobs/${h.ugpuId}/report`, body);
         if (r.stop) this.stop(id);
       } catch (e) {
@@ -156,6 +161,7 @@ class UgpuLink {
   /** Tells ugpu how the job ended, read from the job's own row. */
   async end(id, table) {
     const h = this.held.get(id);
+    this.thumbs.delete(id);
     if (!h) return;
     this.held.delete(id);
     let ok = true;
