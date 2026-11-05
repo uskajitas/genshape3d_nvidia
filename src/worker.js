@@ -720,9 +720,15 @@ class Worker extends EventEmitter {
       // (False is treated as "default", not "explicit no" — the toggle in
       // the UI is opt-IN to override; opt-OUT happens via env or by the
       // heuristic itself when the subject is horizontal.)
+      // A run started from the Generations page says exactly which views it
+      // wants in recipe.views: [] is the front picture alone, ['back'] is two
+      // references, ['back','left'] is three. No recipe.views = the rules below.
+      const wantedViews = Array.isArray(job.recipe && job.recipe.views) ? job.recipe.views.filter((v) => v === 'back' || v === 'left') : null;
       let shouldAutoMv;
       if (autoMvOff || auxImagePaths.length > 0 || jobModelLower !== 'hunyuan3d') {
         shouldAutoMv = false;
+      } else if (wantedViews) {
+        shouldAutoMv = wantedViews.length > 0;
       } else if (job.useMultiView === true) {
         shouldAutoMv = true;
         console.log('[Worker] useMultiView=true on job, running auto-mv regardless of orientation.');
@@ -731,7 +737,7 @@ class Worker extends EventEmitter {
       }
       if (shouldAutoMv) {
         try {
-          const generated = await this.generateLocalMultiView(inputImagePath, tmpDir, job.id);
+          const generated = await this.generateLocalMultiView(inputImagePath, tmpDir, job.id, wantedViews && wantedViews.length ? wantedViews.join(',') : undefined);
           if (generated.localPaths && generated.localPaths.length > 0) {
             auxImagePaths.push(...generated.localPaths);
             // Persist the R2 URLs so the admin trail (worker tray + admin
