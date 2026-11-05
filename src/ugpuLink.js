@@ -46,6 +46,17 @@ class UgpuLink {
     }
   }
 
+  /** What else is on the card, for the worker window. ugpu is the only one who knows. */
+  async others() {
+    const none = { inProgress: [], waiting: [] };
+    const r = await fetch(`${URL_BASE}/api/jobs`, { signal: AbortSignal.timeout(3000) }).catch(() => null);
+    if (!r?.ok) return none;
+    const { jobs } = await r.json();
+    const row = (j) => ({ kind: 'picture', id: j.id, name: j.title, model: j.label, started: new Date(j.startedAt || j.createdAt).toISOString(), created: new Date(j.createdAt).toISOString(), stillMs: 0, why: 'In the queue for the RTX 3090' });
+    const rest = jobs.filter((j) => j.type !== '3d-generation');
+    return { inProgress: rest.filter((j) => j.status === 'in_progress').map(row), waiting: rest.filter((j) => j.status === 'queued').map(row) };
+  }
+
   progress(id, p) {
     const h = this.held.get(id);
     if (!h || !p) return;

@@ -5,8 +5,10 @@ If code and this page disagree, the code is wrong.
 
 ## One source of truth
 
-The truth about work on the 3090 lives on the 3090: one ledger file on this machine, owned by the
-worker.
+`ugpu` owns the card, the queue and the ledger on the 3090 (`ugpu/docs/CONTRACT.md`). Everything on
+the card is a job there. The worker is one customer: it runs 3D work and asks `ugpu` for its turn,
+and keeps no line or lease of its own. Only when `ugpu` is not running does it check the card memory
+itself. Where this page says the worker owns the ledger, read `ugpu`.
 
 - Every piece of work on the card has one entry: 3D models, paints, repairs, parts, pictures and
   edits.

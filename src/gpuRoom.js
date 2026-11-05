@@ -1,4 +1,5 @@
-// Room on the card before a job starts.
+// Room on the card before a job starts. ugpu decides who goes. What follows is only for when ugpu is
+// not running: then the worker looks after itself, as it did before ugpu existed.
 //
 // The image editor and the picture generator keep their models on the card between requests, and
 // Ollama keeps its own. A 3D model started beside them runs out of memory and the runner dies with
@@ -43,8 +44,7 @@ async function neighbourLoading() {
 }
 
 class GpuRoom {
-  constructor(card, ugpu) {
-    this.card = card;
+  constructor(ugpu) {
     this.ugpu = ugpu;
     this.held = new Map();      // job id -> why it is waiting, shown in the window
     this.since = new Map();     // job id -> when it started waiting
@@ -59,10 +59,6 @@ class GpuRoom {
     if (turn === 'go') { this.release(id); return true; }
     if (turn === 'wait') { this.held.set(id, 'In the queue for the RTX 3090'); return false; }
     const need = heavy ? NEED_HEAVY_GB : NEED_LIGHT_GB;
-    if (this.card.holder() || this.card.waiting().length) {
-      this.held.set(id, 'Next, after the picture on the RTX 3090');
-      return false;
-    }
     const loading = await neighbourLoading();
     let card = await gpu();
     if (!loading && (!card || card.freeGb >= need)) { this.release(id); return true; }

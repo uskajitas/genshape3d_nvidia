@@ -1,7 +1,6 @@
 const { EventEmitter } = require('events');
 const { readReport, readHistory } = require('./report');
 const { GpuRoom } = require('./gpuRoom');
-const { CardPolicy } = require('./cardPolicy');
 const { UgpuLink } = require('./ugpuLink');
 const { Pool } = require('pg');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
@@ -68,9 +67,8 @@ class Worker extends EventEmitter {
     this.completedJobs = [];
     this.failedJobs = [];
     this.cancelledJobs = [];
-    this.card = new CardPolicy(() => this.activeCount > 0);
     this.ugpu = new UgpuLink(this);
-    this.gpuRoom = new GpuRoom(this.card, this.ugpu);
+    this.gpuRoom = new GpuRoom(this.ugpu);
   }
 
   getState() {
@@ -107,9 +105,9 @@ class Worker extends EventEmitter {
       });
       read.catch(() => {});
       const report = await Promise.race([read, new Promise((_, no) => { timer = setTimeout(() => no(new Error('the database did not answer in 15 seconds')), 15000); })]);
-      const picture = this.card.holder();
-      if (picture) report.inProgress.unshift({ kind: 'picture', id: 'picture', name: picture.what || 'Picture', model: picture.who, started: picture.since, stillMs: 0 });
-      report.waiting.unshift(...this.card.waiting().map((p) => ({ kind: 'picture', id: p.key, name: p.what, model: p.who, created: p.since, why: 'Goes when the card is free' })));
+      const others = await this.ugpu.others();
+      report.inProgress.unshift(...others.inProgress);
+      report.waiting.unshift(...others.waiting);
       this.report = report;
       this.reportError = null;
     } catch (err) {
@@ -125,7 +123,6 @@ class Worker extends EventEmitter {
 
   async start() {
     console.log('[Worker] Starting poll loop...');
-    this.card.serve();
     this.refreshReport();
     this.reportTimer = setInterval(() => this.refreshReport(), 5000);
     await this.ensureTable();
@@ -646,7 +643,6 @@ class Worker extends EventEmitter {
       );
       if (claim.rowCount === 0) {
         console.log(`[Worker] Job ${job.id} taken by another worker (likely 1080), skipping`);
-        this.activeCount--;
         this.processing = false;
         this.currentJob = null;
         return;
@@ -1403,7 +1399,6 @@ else:
       );
       if (claim.rowCount === 0) {
         console.log(`[TextureWorker] Job ${job.id.slice(0, 8)} already claimed, skipping.`);
-        this.activeCount--;
         return;
       }
 
@@ -1607,7 +1602,6 @@ else:
       );
       if (claim.rowCount === 0) {
         console.log(`[RefineWorker] Job ${job.id.slice(0, 8)} already claimed, skipping.`);
-        this.activeCount--;
         return;
       }
 
@@ -1790,7 +1784,6 @@ else:
       );
       if (claim.rowCount === 0) {
         console.log(`[SegmentWorker] Job ${job.id.slice(0, 8)} already claimed, skipping.`);
-        this.activeCount--;
         return;
       }
 
