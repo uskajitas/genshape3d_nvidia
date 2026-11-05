@@ -87,7 +87,7 @@ class UgpuLink {
   constructor(worker) {
     this.worker = worker;
     this.held = new Map();      // worker job id -> { ugpuId, step, total, phase }
-    this.thumbs = new Map();    // worker job id -> its small picture once fetched, null until then
+    this.thumbs = new Map();    // worker job id -> its small picture to send, null while fetching, false once ugpu has it
     setInterval(() => this.beat(), BEAT_MS).unref();
   }
 
@@ -107,7 +107,8 @@ class UgpuLink {
       });
       // The picture is fetched only once ugpu has answered, and never holds the job up: it follows
       // with the next ask, or with the next report.
-      if (!job.hasThumb && !this.thumbs.has(id)) {
+      if (job.hasThumb) this.thumbs.set(id, false);
+      else if (!this.thumbs.has(id)) {
         this.thumbs.set(id, null);
         thumbOf(info.imageUrl).then((t) => { if (this.thumbs.has(id)) this.thumbs.set(id, t); });
       }
@@ -117,6 +118,12 @@ class UgpuLink {
     } catch {
       return 'down';
     }
+  }
+
+  /** Forgets the pictures of jobs that are no longer waiting or running. */
+  forget(waitingIds) {
+    const keep = new Set(waitingIds);
+    for (const id of this.thumbs.keys()) if (!keep.has(id) && !this.held.has(id)) this.thumbs.delete(id);
   }
 
   /** What else is on the card, for the worker window. ugpu is the only one who knows. */
@@ -142,7 +149,7 @@ class UgpuLink {
       try {
         const body = { phase: h.phase };
         if (h.total) Object.assign(body, { done: h.step, total: h.total });
-        if (this.thumbs.get(id)) { body.thumb = this.thumbs.get(id); this.thumbs.delete(id); }
+        if (this.thumbs.get(id)) { body.thumb = this.thumbs.get(id); this.thumbs.set(id, false); }
         const r = await post(`/api/jobs/${h.ugpuId}/report`, body);
         if (r.stop) this.stop(id);
       } catch (e) {

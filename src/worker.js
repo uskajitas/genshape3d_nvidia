@@ -2,6 +2,9 @@ const { EventEmitter } = require('events');
 const { readReport, readHistory } = require('./report');
 const { GpuRoom } = require('./gpuRoom');
 const { UgpuLink, describe } = require('./ugpuLink');
+
+/** How many waiting jobs are shown in ugpu's queue at once. */
+const WALL_LINE = 25;
 const { Pool } = require('pg');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { spawn } = require('child_process');
@@ -529,8 +532,20 @@ class Worker extends EventEmitter {
             || (isHeavy(nextJob) && (this.processingJobs.length > 0 || this.refineActive));
           if (blocked) {
             console.log(`[Worker] holding ${nextJob.id.slice(0,8)} — GPU exclusivity (heavy job running or queued job is heavy).`);
-          } else if (this.activeCount > 0 || await this.gpuRoom.ready(nextJob.id, isHeavy(nextJob), describe('model', nextJob))) {
+          } else if (this.activeCount > 0) {
             this.processJob(nextJob);
+          } else {
+            // Every waiting job stands in ugpu's queue, so the wall shows the whole line, not only
+            // the next one. ugpu says which goes; that one is started.
+            const waiting = this._pendingForClaim.filter((j) => !j.requestCancel).slice(0, WALL_LINE);
+            this.ugpu.forget(waiting.map((j) => j.id));
+            for (const job of waiting) {
+              if (await this.gpuRoom.ready(job.id, isHeavy(job), describe('model', job))) {
+                this.processJob(job);
+                break;
+              }
+              if (this.gpuRoom.ugpuDown) break; // no ugpu: only the next job is tried, as before
+            }
           }
         }
       }

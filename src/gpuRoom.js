@@ -56,6 +56,7 @@ class GpuRoom {
   /** True when the job may start now. */
   async ready(id, heavy, info) {
     const turn = await this.ugpu.ask(id, heavy, info);
+    this.ugpuDown = turn === 'down';
     if (turn === 'go') { this.release(id); return true; }
     if (turn === 'wait') { this.held.set(id, 'In the queue for the RTX 3090'); return false; }
     const need = heavy ? NEED_HEAVY_GB : NEED_LIGHT_GB;
