@@ -6,6 +6,8 @@
 //   node landing_generations.js --pictures gives the workspace a picture row for every job of this script that lacks one
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
 require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
 const { Client } = require('pg');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
@@ -50,13 +52,83 @@ const SUBJECTS = [
   ['Edificio Coltejer', 'a scale model replica of the Edificio Coltejer tower in Medellin, Colombia: a tall slim concrete skyscraper with rows of narrow vertical windows and a pointed top shaped like a weaving needle, rising from a wide low base building'],
   ['Taj Mahal', 'a scale model of the Taj Mahal in India, white marble with a large central onion dome, four smaller domes, four slim minarets at the corners and a square platform'],
   ['Flying car', 'a sleek futuristic two seat flying car with a low smooth silver body, a glass bubble canopy, four enclosed round rotor fans at the corners and red tail lights, hovering on a small clear stand'],
+  ['Vintage typewriter', 'a chunky vintage typewriter in glossy dark green with round metal keys, a silver carriage and a sheet of cream paper'],
+  ['Espresso machine', 'a retro espresso machine in polished chrome and red with two thick handles, a round pressure gauge and a small white cup'],
+  ['Electric guitar', 'a chunky electric guitar in sunburst orange with a white pickguard, chrome pickups and six tuning pegs, standing on a small stand'],
+  ['Drum kit', 'a compact toy-like drum kit in glossy blue with a big bass drum, two toms, a snare and two golden cymbals'],
+  ['Grand piano', 'a small stylized black grand piano with its lid open, white and black keys, golden strings inside and a round stool'],
+  ['Vinyl turntable', 'a retro vinyl turntable in walnut wood with a black record, a silver tone arm and two round knobs'],
+  ['Gaming console', 'a chunky retro gaming console in grey and purple with a cartridge inserted and a thick wired controller beside it'],
+  ['Mechanical keyboard', 'a compact mechanical keyboard with chunky colorful keycaps in orange, cream and teal on a brushed aluminum case'],
+  ['Satellite', 'a chunky space satellite with a gold foil body, two wide blue solar panels and a white round dish antenna, on a small stand'],
+  ['Mars rover', 'a detailed six wheeled mars rover in white and copper with a camera mast, a small dish and thick wheels, on a patch of red rocky ground'],
+  ['Lunar lander', 'a chunky lunar lander with a gold foil body, four thick landing legs, a small round hatch and a ladder, on a grey moon surface base'],
+  ['Space station', 'a compact sci-fi space station module with a white ring, a central cylinder and four solar panels, on a small stand'],
+  ['Fire truck', 'a chunky red fire truck with a silver ladder on top, round headlights, thick black tires and a golden stripe'],
+  ['London bus', 'a chunky red double decker bus with rows of windows, round headlights and thick black tires'],
+  ['Classic muscle car', 'a classic american muscle car in deep blue with two white racing stripes, chrome bumpers and wide tires'],
+  ['Formula race car', 'a sleek open wheel formula race car in red and white with a wide front wing, a tall rear wing and thick slick tires'],
+  ['Yellow taxi', 'a chunky stylized yellow taxi cab with a checker stripe, a small roof sign, round headlights and thick tires'],
+  ['Helicopter', 'a chunky rescue helicopter in orange and white with a big glass nose, a thick main rotor, a tail rotor and two landing skids'],
+  ['Biplane', 'a vintage red biplane with two stacked wings, a wooden propeller, a round engine and two thick wheels'],
+  ['Sailing boat', 'a stylized wooden sailing boat with one tall mast, thick cream sails, a blue hull and a small cabin, on a small water base'],
+  ['Tractor', 'a chunky green farm tractor with huge black rear wheels, small front wheels, a yellow seat and a short exhaust pipe'],
+  ['Excavator', 'a chunky yellow excavator with a thick jointed arm, a steel bucket, a glass cab and black tracks'],
+  ['Eiffel Tower', 'a scale model of the Eiffel Tower in Paris in dark bronze iron lattice with its arched base and thick legs, on a square stone platform'],
+  ['Colosseum', 'a scale model of the Colosseum in Rome in warm stone with rows of arches and its broken outer wall, on a round base'],
+  ['Great Pyramid', 'a scale model of the great pyramid of Giza with the Sphinx in front of it, sandstone blocks, on a square desert sand base'],
+  ['Statue of Liberty', 'a scale model of the Statue of Liberty in green copper, holding a golden torch and a tablet, on a tall stone pedestal'],
+  ['Machu Picchu', 'a scale model of Machu Picchu in Peru with stone terraces, small stone buildings and one tall green mountain peak, on a round base'],
+  ['Big Ben', 'a scale model of the Big Ben clock tower in London in golden stone with a white clock face and a dark pointed roof, on a square base'],
+  ['Corgi', 'a cute chubby corgi dog in orange and white with big ears and a happy face, sitting on a small round cushion'],
+  ['Red fox', 'a stylized sitting red fox with a thick bushy tail, a white chest and black paws, on a mossy rock'],
+  ['Owl', 'a chubby stylized snowy owl with big round golden eyes and thick feathers, perched on a short tree stump'],
+  ['Elephant', 'a chunky stylized baby elephant in soft grey with big round ears, a short trunk and a colorful patterned blanket on its back'],
+  ['Sea turtle', 'a stylized green sea turtle with a thick patterned shell and four wide flippers, on a small coral reef base'],
+  ['Toucan', 'a chubby stylized toucan with a huge orange and yellow beak, black feathers and a white chest, perched on a thick branch'],
+  ['Ice cream sundae', 'a tall ice cream sundae in a clear glass with three colorful scoops, whipped cream, chocolate sauce and a red cherry on top'],
+  ['Pizza', 'a whole round pepperoni pizza on a wooden board with thick crust, melted cheese and basil leaves, one slice slightly pulled out'],
+  ['Arepa breakfast', 'a colombian breakfast on a round clay plate with two thick golden arepas, fried egg, white cheese and a small cup of hot chocolate'],
+  ['Fantasy sword', 'a large fantasy sword with a glowing blue blade, a golden crossguard and a leather grip, standing upright in a rock'],
+  ['Crystal cluster', 'a large cluster of glowing purple and teal crystals growing from a dark rock base'],
+  ['Wooden galleon', 'a chunky wooden pirate galleon with three masts, cream sails, a carved stern and rows of small cannons, on a small water base'],
 ];
 
 const sleep = (ms) => new Promise((go) => setTimeout(go, ms));
 
+// Each picture is kept on disk as soon as it is drawn, so a run that dies starts again where it stopped.
+const DRAWN = 'G:/projects_support/landing_pictures';
+const drawnFile = (name) => path.join(DRAWN, name.replace(/[^\w-]+/g, '_') + '.png');
+const RETRIES = 2;
+
+/** Stays until every job of this script is done, and gives a failed one another turn. */
+async function watch(db) {
+  const names = SUBJECTS.map(([n]) => n);
+  const tries = new Map();
+  const until = Date.now() + 7 * 3600_000;
+  while (Date.now() < until) {
+    const { rows } = await db.query(`SELECT id, name, status FROM genshape3d_jobs WHERE source = $1 AND deleted = false AND name = ANY($2)`, [SOURCE, names]);
+    let open = rows.filter((j) => j.status === 'pending' || j.status === 'processing').length;
+    for (const j of rows.filter((x) => x.status === 'failed')) {
+      const n = tries.get(j.id) || 0;
+      if (n >= RETRIES) continue;
+      tries.set(j.id, n + 1);
+      open++;
+      console.log(`again ${j.name}`);
+      await db.query(`UPDATE genshape3d_jobs SET status = 'pending', "errorMessage" = '', "progressPct" = 0, "progressPhase" = '', "completedAt" = NULL, "updatedAt" = NOW() WHERE id = $1`, [j.id]);
+    }
+    if (!open) return console.log(`finished: ${rows.filter((j) => j.status === 'done').length} done, ${rows.filter((j) => j.status === 'failed').length} failed`);
+    await sleep(60_000);
+  }
+  console.log('stopped watching after 7 hours');
+}
+
 /** The card is queued by ugpu: "busy" means this picture waits its turn. Asking again keeps the place. */
 async function picture(prompt) {
+  let faults = 0;
   for (;;) {
+    // Never ask for a model load on a machine that is short of memory.
+    while (os.freemem() < 4 * 2 ** 30) await sleep(20_000);
     const r = await fetch(IMAGE_GEN + '/generate', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -65,7 +137,10 @@ async function picture(prompt) {
     }).catch(() => null);
     const j = r ? await r.json().catch(() => ({})) : {};
     if (r && r.ok && j.image) return Buffer.from(j.image.split(',')[1], 'base64');
-    if (r && r.status !== 503) throw new Error(`picture generator: ${r.status} ${JSON.stringify(j).slice(0, 200)}`);
+    if (r && r.status !== 503) {
+      if (++faults > 5) throw new Error(`picture generator: ${r.status} ${JSON.stringify(j).slice(0, 200)}`);
+      await sleep(30_000);
+    }
     await sleep(3000);
   }
 }
@@ -95,10 +170,13 @@ async function main() {
   const have = new Set((await db.query(`SELECT name FROM genshape3d_jobs WHERE source = $1 AND deleted = false`, [SOURCE])).rows.map((r) => r.name));
   // Every picture first, then every 3D job. Taking turns would make the card swap the picture model
   // and the 3D model in and out for each subject, and each swap loads tens of GB: the machine freezes.
+  fs.mkdirSync(DRAWN, { recursive: true });
   const drawn = [];
   for (const [name, prompt] of SUBJECTS) {
     if (have.has(name)) { console.log(`skip ${name}: already in the workspace`); continue; }
-    drawn.push([name, prompt, await picture(prompt)]);
+    const file = drawnFile(name);
+    if (!fs.existsSync(file)) fs.writeFileSync(file, await picture(prompt));
+    drawn.push([name, prompt, fs.readFileSync(file)]);
     console.log(`picture ${name}`);
   }
   let queued = 0;
@@ -117,8 +195,9 @@ async function main() {
     queued++;
     console.log(`queued ${name}`);
   }
-  await db.end();
   console.log(`${queued} landing page generations queued.`);
+  await watch(db);
+  await db.end();
 }
 
 main().catch((e) => { console.error('FAULT', e.message); process.exit(1); });
