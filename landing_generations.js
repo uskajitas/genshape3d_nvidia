@@ -56,10 +56,16 @@ async function main() {
     credentials: { accessKeyId: process.env.R2_ACCESS_KEY_ID, secretAccessKey: process.env.R2_SECRET_ACCESS_KEY },
   });
   const have = new Set((await db.query(`SELECT name FROM genshape3d_jobs WHERE source = $1 AND deleted = false`, [SOURCE])).rows.map((r) => r.name));
-  let queued = 0;
+  // Every picture first, then every 3D job. Taking turns would make the card swap the picture model
+  // and the 3D model in and out for each subject, and each swap loads tens of GB: the machine freezes.
+  const drawn = [];
   for (const [name, prompt] of SUBJECTS) {
     if (have.has(name)) { console.log(`skip ${name}: already in the workspace`); continue; }
-    const png = await picture(prompt);
+    drawn.push([name, prompt, await picture(prompt)]);
+    console.log(`picture ${name}`);
+  }
+  let queued = 0;
+  for (const [name, prompt, png] of drawn) {
     const isJpeg = png[0] === 0xff && png[1] === 0xd8;
     const key = `uploads/${Date.now()}-${crypto.randomUUID()}.${isJpeg ? 'jpg' : 'png'}`;
     await s3.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET || 'genshape3d', Key: key, Body: png, ContentType: isJpeg ? 'image/jpeg' : 'image/png' }));
