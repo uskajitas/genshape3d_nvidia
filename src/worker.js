@@ -13,11 +13,11 @@ const isHeavyJob = (j) => {
 };
 const { Pool } = require('pg');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
+const os = require('os');
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 const crypto = require('crypto');
 
 // Worker — same code runs on both the 1080 (i7) and the 3090.
@@ -1267,6 +1267,26 @@ else:
       }
     };
 
+    // Memory. A runner that asks for more than the machine has does not fail on Windows: it is
+    // paged to disk and the whole desktop freezes for as long as it runs. So a runner holding most
+    // of the RAM while almost none is free, three readings in a row, is stopped.
+    const MAX_GB = parseFloat(process.env.RUNNER_MAX_MEMORY_GB || String(Math.round(os.totalmem() / 2 ** 30 * 0.8)));
+    let starved = 0;
+    const memory = process.platform !== 'win32' ? null : setInterval(() => {
+      const ask = `(Get-CimInstance Win32_Process -Filter 'ProcessId=${proc.pid} OR ParentProcessId=${proc.pid}' | Measure-Object PageFileUsage -Sum).Sum`;
+      execFile('powershell', ['-NoProfile', '-Command', ask], { windowsHide: true, timeout: 12000 }, (err, out) => {
+        if (err || killedWhy) return;
+        const heldGb = (parseInt(out, 10) || 0) / 2 ** 20;
+        const freeGb = os.freemem() / 2 ** 30;
+        starved = heldGb > MAX_GB && freeGb < 2.5 ? starved + 1 : 0;
+        if (starved >= 3) {
+          killTree(`took ${heldGb.toFixed(0)} GB of memory and left the machine ${freeGb.toFixed(1)} GB: it was freezing the computer`);
+          clearInterval(timer);
+          clearInterval(memory);
+        }
+      });
+    }, 15 * 1000);
+
     const timer = setInterval(() => {
       const now = Date.now();
       if (now - startedAt > HARD_MS) {
@@ -1280,7 +1300,7 @@ else:
 
     return {
       touch: () => { lastOutputAt = Date.now(); },
-      stop: () => clearInterval(timer),
+      stop: () => { clearInterval(timer); clearInterval(memory); },
       killedWhy: () => killedWhy,
     };
   }
