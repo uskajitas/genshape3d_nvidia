@@ -3,6 +3,7 @@
 // each in the workspace "landingpage", the same settings as the ones already there (Trellis 2, 2K
 // texture, 200,000 faces). ugpu queues everything; the worker takes the 3D jobs one at a time.
 //   node landing_generations.js            queues every subject below that is not in the workspace yet
+//   node landing_generations.js --pictures gives the workspace a picture row for every job of this script that lacks one
 const path = require('path');
 const crypto = require('crypto');
 require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
@@ -13,7 +14,12 @@ const IMAGE_GEN = process.env.IMAGE_GEN_URL || 'http://127.0.0.1:8430';
 const PUBLIC = (process.env.R2_ASSETS_URL || 'https://assets.genshape3d.com').replace(/\/$/, '');
 const EMAIL = 'usquiano@gmail.com';
 const SOURCE = 'ws-landingpage';
-const FRAME = 'one single isolated object, whole object in frame, centered, three quarter view, plain light grey background, soft studio lighting, 3d render';
+// The same wording the app puts after a prompt, so the pictures match the ones made there.
+const FRAME = 'one single isolated object, whole object visible with space around it, centered, three quarter front view, plain solid black background, soft studio lighting, highly detailed stylized 3D game asset, rich saturated colors, clean silhouette';
+
+/** The workspace shows a picture only if it has a row of its own: a 3D job alone does not appear there. */
+const ASSET = `INSERT INTO genshape3d_text2image_assets (id, user_email, name, prompt, final_prompt, params, provider, image_key, "viewLabel", "readyFor3D", tags, source, created_at)
+  VALUES ($1, $2, $3, $4, $4, '{"h":1024,"w":1024,"refCount":0}', 'local-qwen-image', $5, 'front', true, '{landing}', $6, $7)`;
 
 const SUBJECTS = [
   ['Hot air balloon', 'a chunky toy hot air balloon with red and yellow stripes, a thick wicker basket and four thick ropes, resting on a small round base'],
@@ -67,6 +73,19 @@ async function picture(prompt) {
 async function main() {
   const db = new Client({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 8000 });
   await db.connect();
+  if (process.argv.includes('--pictures')) {
+    const names = SUBJECTS.map(([n]) => n);
+    const { rows } = await db.query(
+      `SELECT j.name, j.prompt, j."imageUrl", j."createdAt" FROM genshape3d_jobs j
+       WHERE j.source = $1 AND j.deleted = false AND j.name = ANY($2)
+         AND NOT EXISTS (SELECT 1 FROM genshape3d_text2image_assets a WHERE a.image_key = replace(j."imageUrl", $3, ''))`,
+      [SOURCE, names, PUBLIC + '/'],
+    );
+    for (const j of rows) await db.query(ASSET, [crypto.randomUUID(), EMAIL, j.name, j.prompt, j.imageUrl.replace(PUBLIC + '/', ''), SOURCE, new Date(j.createdAt)]);
+    console.log(`${rows.length} pictures added to the workspace.`);
+    await db.end();
+    return;
+  }
   const s3 = new S3Client({
     region: 'auto',
     endpoint: process.env.R2_ENDPOINT,
@@ -94,6 +113,7 @@ async function main() {
        VALUES ($1,$2,$3,$4,'Realistic','pending','Medium (50k-200k)','2K','GLB','Standard',true,512,200000,20,7,$5,'trellis2','win-3090','{}',$6,$7,NOW())`,
       [crypto.randomUUID(), EMAIL, `${PUBLIC}/${key}`, prompt, name, SOURCE, new Date().toISOString()],
     );
+    await db.query(ASSET, [crypto.randomUUID(), EMAIL, name, `${prompt}, ${FRAME}`, key, SOURCE, new Date()]);
     queued++;
     console.log(`queued ${name}`);
   }
